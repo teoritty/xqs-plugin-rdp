@@ -42,3 +42,6 @@ go.work.sum
 
 # Throwaway spike code (phase 0). Never committed.
 /spike/
+
+# Playwright MCP session artifacts (spike observation only).
+/.playwright-mcp/
