@@ -217,3 +217,10 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 func (c *Conn) opError(op string, err error) error {
 	return &net.OpError{Op: op, Net: c.addr.Network(), Addr: c.addr, Err: err}
 }
+
+// RecvWindow отдаёт приёмное окно канала.
+//
+// Нужен связке кредитных окон: чтобы притормозить RDP-сервер, она удерживает
+// гранты именно этого окна. Возвращается сам объект, а не копия состояния —
+// удержание должно действовать на то окно, которое реально выдаёт кредиты.
+func (c *Conn) RecvWindow() *RecvWindow { return c.recvWin }
