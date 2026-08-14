@@ -27,10 +27,11 @@ type Dispatcher struct {
 	w        io.Writer
 	handlers map[string]Handler
 	sink     ChannelSink
+	caller   *caller
 }
 
 func NewDispatcher(w io.Writer) *Dispatcher {
-	return &Dispatcher{w: w, handlers: make(map[string]Handler)}
+	return &Dispatcher{w: w, handlers: make(map[string]Handler), caller: newCaller()}
 }
 
 // Handle регистрирует обработчик метода. Вызывается до Serve, из одной
@@ -66,12 +67,41 @@ func (d *Dispatcher) Serve(r io.Reader) error {
 	}
 }
 
+// incoming — сообщение управляющей плоскости до того, как решено, что это.
+//
+// В JSON-RPC 2.0 запрос и ответ различаются наличием method, а не отдельным
+// признаком. Разбирать их в один тип и решать по нему — единственный способ не
+// принять ответ хоста за вызов к нам.
+type incoming struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *Error          `json:"error,omitempty"`
+}
+
 func (d *Dispatcher) serveRPC(payload []byte) {
-	var req Request
-	if err := json.Unmarshal(payload, &req); err != nil {
+	var msg incoming
+	if err := json.Unmarshal(payload, &msg); err != nil {
 		d.write(NewError(nil, CodeParse, "malformed JSON-RPC"))
 		return
 	}
+	// Нет method — это ответ на наш вызов.
+	if msg.Method == "" {
+		if len(msg.ID) == 0 {
+			slog.Warn("ipc: сообщение без method и без id — отброшено")
+			return
+		}
+		if !d.caller.deliver(&msg) {
+			// Либо мы уже сдались по таймауту, либо сопоставляем неверно.
+			// Молча проглотить значило бы скрыть второе.
+			slog.Warn("ipc: ответ на неизвестный вызов", "id", string(msg.ID))
+		}
+		return
+	}
+
+	req := Request{JSONRPC: msg.JSONRPC, ID: msg.ID, Method: msg.Method, Params: msg.Params}
 	h, ok := d.handlers[req.Method]
 	if !ok {
 		// Неизвестная нотификация — норма: хост шлёт то, что ему нужно, и
