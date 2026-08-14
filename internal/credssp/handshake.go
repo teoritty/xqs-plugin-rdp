@@ -81,9 +81,12 @@ type Credentials struct {
 
 // Authenticate проводит полный обмен CredSSP поверх уже установленного TLS.
 //
-// rw — открытый поток внутри TLS-туннеля к серверу. serverPubKey — DER
-// SubjectPublicKeyInfo сертификата сервера, тот же материал, по которому
-// internal/trust считает отпечаток.
+// rw — открытый поток внутри TLS-туннеля к серверу.
+//
+// serverPubKey — содержимое BIT STRING из SubjectPublicKeyInfo сертификата
+// сервера (trust.SubjectPublicKey), а НЕ вся структура SPKI и не материал
+// отпечатка. Так берут ключ и Windows, и IronRDP, и FreeRDP; посчитав привязку
+// от SPKI целиком, мы получаем от сервера обрыв TLS без объяснений — проверено.
 //
 // Порядок обмена (MS-CSSP 3.1.5), три сообщения от нас и два от сервера:
 //

@@ -1,6 +1,7 @@
 package trust_test
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -181,5 +182,43 @@ func TestVerifyChainUsesLeafAndRejectsEmpty(t *testing.T) {
 	}
 	if err := trust.VerifyChain(chain, issuerFP); err == nil {
 		t.Fatal("пин промежуточного сертификата принят вместо листа")
+	}
+}
+
+// SubjectPublicKey обязан отдавать содержимое BIT STRING, а не SPKI целиком:
+// именно к нему привязывается CredSSP, и подмена материала на «похожий»
+// проявится как обрыв TLS сервером без объяснений.
+func TestSubjectPublicKeyIsBitStringContentsNotWholeSPKI(t *testing.T) {
+	der := certDER(t, "host")
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	got, err := trust.SubjectPublicKey(der)
+	if err != nil {
+		t.Fatalf("SubjectPublicKey: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("пустой ключ")
+	}
+	if bytes.Equal(got, cert.RawSubjectPublicKeyInfo) {
+		t.Fatal("вернулся SubjectPublicKeyInfo целиком — это другой материал")
+	}
+	if len(got) >= len(cert.RawSubjectPublicKeyInfo) {
+		t.Fatalf("ключ (%d) не короче SPKI (%d)", len(got), len(cert.RawSubjectPublicKeyInfo))
+	}
+	// Он обязан лежать внутри SPKI как подпоследовательность.
+	if !bytes.Contains(cert.RawSubjectPublicKeyInfo, got) {
+		t.Fatal("возвращённые байты не найдены внутри SubjectPublicKeyInfo")
+	}
+	// Для P-256 это несжатая точка: 0x04 и 64 байта координат.
+	if got[0] != 0x04 || len(got) != 65 {
+		t.Fatalf("для P-256 ожидалась несжатая точка 65 байт, получено %d байт с префиксом %#x", len(got), got[0])
+	}
+}
+
+func TestSubjectPublicKeyRejectsGarbage(t *testing.T) {
+	if _, err := trust.SubjectPublicKey([]byte{0xFF, 0xFF}); err == nil {
+		t.Fatal("мусор обязан быть ошибкой")
 	}
 }
