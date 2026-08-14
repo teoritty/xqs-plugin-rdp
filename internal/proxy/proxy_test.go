@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -165,25 +166,26 @@ func (h *harness) writeRequest(t *testing.T, raw []byte) {
 	}()
 }
 
-// Главная проверка пакета: пока сервер не подтверждён, учётные данные никуда
-// не уходят. Отпечаток не задан — значит подключение обязано оборваться ДО
-// CredSSP, а не «на всякий случай попробовать».
-func TestHandshakeRefusesUnknownServerBeforeSendingCredentials(t *testing.T) {
+// trustAll и denyAll — ответы ядра, а не политика плагина: решение переехало
+// в ядро, и здесь мы проверяем, что плагин с обоими ответами обращается верно.
+func trustAll(context.Context, []byte) (bool, error) { return true, nil }
+func denyAll(context.Context, []byte) (bool, error)  { return false, nil }
+
+// Главная проверка пакета: пока ядро не подтвердило сервер, учётные данные
+// никуда не уходят. Подключение обязано оборваться ДО CredSSP, а не «на всякий
+// случай попробовать».
+func TestHandshakeRefusesUntrustedServerBeforeSendingCredentials(t *testing.T) {
 	cert, _ := testCert(t)
 	h := newHarness(t, connectConfirm(x224.ProtocolHybrid), &cert)
 	h.writeRequest(t, browserRequest(t, "10.0.0.9:3389"))
 
 	_, err := proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
 		Address:     "192.168.31.38:3389",
-		Fingerprint: "", // пользователь ещё не подтверждал этот сервер
+		VerifyPeer:  denyAll, // ядро задало вопрос пользователю
 		Credentials: credssp.Credentials{Username: "admin", Password: []byte("hunter2")},
 	})
-	if err == nil {
-		t.Fatal("подключение к неподтверждённому серверу состоялось")
-	}
-	var unknown *trust.UnknownServerError
-	if !errors.As(err, &unknown) {
-		t.Fatalf("err типа %T (%v), ожидался *trust.UnknownServerError", err, err)
+	if !errors.Is(err, proxy.ErrPeerNotTrusted) {
+		t.Fatalf("err = %v, ожидалась ErrPeerNotTrusted", err)
 	}
 	// И, что важнее формулировки ошибки: серверу не отправлено ни байта
 	// прикладных данных — то есть ни NTLM, ни тем более учётных данных.
@@ -192,24 +194,75 @@ func TestHandshakeRefusesUnknownServerBeforeSendingCredentials(t *testing.T) {
 	}
 }
 
-// Отпечаток не тот — то же самое, но сообщение обязано быть другим: сменившийся
-// ключ и отсутствие пина требуют разных действий.
-func TestHandshakeRefusesMismatchedFingerprint(t *testing.T) {
+// Цель без проверки доверия — отказ, а не подключение без проверки. Забытая
+// проводка не должна молча превращаться в отсутствие защиты.
+func TestHandshakeRefusesTargetWithoutVerifier(t *testing.T) {
 	cert, _ := testCert(t)
 	h := newHarness(t, connectConfirm(x224.ProtocolHybrid), &cert)
 	h.writeRequest(t, browserRequest(t, "x"))
 
 	_, err := proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
 		Address:     "192.168.31.38:3389",
-		Fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		Credentials: credssp.Credentials{Username: "admin", Password: []byte("hunter2")},
 	})
-	var mismatch *trust.MismatchError
-	if !errors.As(err, &mismatch) {
-		t.Fatalf("err типа %T (%v), ожидался *trust.MismatchError", err, err)
+	if !errors.Is(err, proxy.ErrNoPeerVerifier) {
+		t.Fatalf("err = %v, ожидалась ErrNoPeerVerifier", err)
 	}
 	if n := h.server.applicationBytes(); n != 0 {
-		t.Fatalf("серверу отправлено %d прикладных байт при несовпавшем отпечатке", n)
+		t.Fatalf("серверу отправлено %d прикладных байт без всякой проверки", n)
+	}
+}
+
+// Недоступное ядро — тоже отказ. Сбой связи с тем, кто принимает решение, не
+// повод принять решение самому.
+func TestHandshakeRefusesWhenTheCoreCannotAnswer(t *testing.T) {
+	cert, _ := testCert(t)
+	h := newHarness(t, connectConfirm(x224.ProtocolHybrid), &cert)
+	h.writeRequest(t, browserRequest(t, "x"))
+
+	boom := errors.New("шина недоступна")
+	_, err := proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
+		Address: "192.168.31.38:3389",
+		VerifyPeer: func(context.Context, []byte) (bool, error) {
+			return false, boom
+		},
+		Credentials: credssp.Credentials{Username: "admin", Password: []byte("hunter2")},
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, ожидалась причина от ядра", err)
+	}
+	if errors.Is(err, proxy.ErrPeerNotTrusted) {
+		t.Fatal("сбой связи выдан за отказ пользователя — это разные события")
+	}
+	if n := h.server.applicationBytes(); n != 0 {
+		t.Fatalf("серверу отправлено %d прикладных байт при недоступном ядре", n)
+	}
+}
+
+// Ядру уходит SubjectPublicKeyInfo сервера — ровно то, по чему оно считает
+// отпечаток. Прислать другие байты значило бы записать доверие не к тому, с кем
+// мы говорим, и потом никогда с ним не совпасть.
+func TestHandshakeHandsTheCoreTheServersSPKI(t *testing.T) {
+	cert, _ := testCert(t)
+	h := newHarness(t, connectConfirm(x224.ProtocolHybrid), &cert)
+	h.writeRequest(t, browserRequest(t, "x"))
+
+	var seen []byte
+	_, _ = proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
+		Address: "192.168.31.38:3389",
+		VerifyPeer: func(_ context.Context, material []byte) (bool, error) {
+			seen = append([]byte(nil), material...)
+			return false, nil
+		},
+		Credentials: credssp.Credentials{Username: "u", Password: []byte("p")},
+	})
+
+	want, err := trust.PeerMaterial(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("PeerMaterial: %v", err)
+	}
+	if !bytes.Equal(seen, want) {
+		t.Fatalf("ядру ушло %d байт, ожидался SPKI сервера (%d байт)", len(seen), len(want))
 	}
 }
 
@@ -219,9 +272,12 @@ func TestHandshakeAsksServerForHybridOnly(t *testing.T) {
 	h := newHarness(t, connectConfirm(x224.ProtocolHybrid), &cert)
 	h.writeRequest(t, browserRequest(t, "x"))
 
+	// denyAll, а не trustAll: запрошенные протоколы уходят серверу ДО проверки
+	// доверия, а подтверждённый сервер увёл бы тест в CredSSP и заставил его
+	// ждать полный таймаут рукопожатия ради значения, известного раньше.
 	_, _ = proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
 		Address:     "192.168.31.38:3389",
-		Fingerprint: "",
+		VerifyPeer:  denyAll,
 		Credentials: credssp.Credentials{Username: "u", Password: []byte("p")},
 	})
 
@@ -238,7 +294,7 @@ func TestHandshakeRefusesDowngradeToSSL(t *testing.T) {
 
 	_, err := proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
 		Address:     "192.168.31.38:3389",
-		Fingerprint: "SHA256:whatever",
+		VerifyPeer:  trustAll,
 		Credentials: credssp.Credentials{Username: "u", Password: []byte("p")},
 	})
 	if err == nil {
@@ -257,7 +313,7 @@ func TestHandshakeSurfacesNegotiationFailure(t *testing.T) {
 
 	_, err := proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
 		Address:     "192.168.31.38:3389",
-		Fingerprint: "SHA256:whatever",
+		VerifyPeer:  trustAll,
 		Credentials: credssp.Credentials{Username: "u", Password: []byte("p")},
 	})
 	var failure *x224.NegotiationFailure
@@ -277,7 +333,7 @@ func TestHandshakeRejectsGarbageFromBrowser(t *testing.T) {
 
 	_, err := proxy.Handshake(context.Background(), h.browser, h.serverOur, proxy.Target{
 		Address:     "192.168.31.38:3389",
-		Fingerprint: "SHA256:whatever",
+		VerifyPeer:  trustAll,
 		Credentials: credssp.Credentials{Username: "u", Password: []byte("p")},
 	})
 	if err == nil {

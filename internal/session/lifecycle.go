@@ -122,6 +122,14 @@ func (m *Manager) run(ctx context.Context, a *active, parsed request) {
 			slog.Debug("session: подключение отменено", "sessionId", a.id)
 			return
 		}
+		if errors.Is(err, proxy.ErrPeerNotTrusted) {
+			// Ядро уже спросило пользователя и перевело сессию в ожидание
+			// решения. Сообщить здесь об ошибке значило бы затереть заданный
+			// вопрос ответом «не удалось» — и вопрос исчез бы с экрана
+			// раньше, чем на него ответили.
+			slog.Info("session: ждём решения пользователя о доверии", "sessionId", a.id)
+			return
+		}
 		slog.Error("session: подключение не удалось", "sessionId", a.id, "err", err.Error())
 		m.fail(a.id, err)
 		return
@@ -147,6 +155,12 @@ func (m *Manager) connect(ctx context.Context, a *active, parsed request) error 
 	}
 
 	// 4. Рукопожатие. Здесь и только здесь живёт пароль.
+	//
+	// Проверка доверия подставляется здесь, а не при разборе параметров: она
+	// обращается к ядру, а значит нужна шина и идентификатор сессии.
+	parsed.target.VerifyPeer = func(vctx context.Context, material []byte) (bool, error) {
+		return m.verifyPeer(vctx, a.id, parsed.target.Address, material)
+	}
 	serverTLS, err := proxy.Handshake(ctx, browser, server, parsed.target)
 	if err != nil {
 		// Браузеру надо сказать, что не вышло: иначе он ждёт ответа, которого

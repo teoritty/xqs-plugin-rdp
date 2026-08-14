@@ -38,11 +38,29 @@ type Target struct {
 	// скомпрометированная страница может заставить плагин дозвониться куда
 	// угодно в локальной сети под нашим allowArbitraryOutbound.
 	Address string
-	// Fingerprint — подтверждённый пользователем отпечаток ключа сервера.
-	// Пустой — отказ подключаться (см. internal/trust).
-	Fingerprint string
+	// VerifyPeer спрашивает у ядра, доверяем ли мы тому, кто на том конце.
+	//
+	// Функция, а не отпечаток в поле: решение принимает пользователь, а помнит
+	// ядро. Плагину при isolation per-session помнить негде — каталог данных
+	// живёт ровно одну сессию, — и хранить доверие тут значило бы обещать то,
+	// чего мы сдержать не можем.
+	//
+	// nil — отказ подключаться. Проверка, которую забыли подключить, не должна
+	// молча превращаться в её отсутствие.
+	VerifyPeer  func(ctx context.Context, material []byte) (bool, error)
 	Credentials credssp.Credentials
 }
+
+// ErrPeerNotTrusted — ядро не подтвердило сервер.
+//
+// Отдельная ошибка, а не текст: вызывающий обязан отличить её от сбоя. Ядро в
+// этот момент уже спросило пользователя и перевело сессию в ожидание решения,
+// поэтому сообщать поверх этого об ошибке значило бы затереть заданный вопрос
+// ответом «не удалось».
+var ErrPeerNotTrusted = errors.New("proxy: сервер не подтверждён пользователем")
+
+// ErrNoPeerVerifier — цель собрана без проверки доверия.
+var ErrNoPeerVerifier = errors.New("proxy: не задана проверка доверия к серверу")
 
 // Handshake проводит рукопожатие между браузером и RDP-сервером.
 //
@@ -147,7 +165,7 @@ func connectServer(ctx context.Context, server net.Conn, browserCR []byte, targe
 	}
 
 	// 3. Кто на том конце. До CredSSP, а не после.
-	if err := trust.Verify(certs[0].Raw, target.Fingerprint); err != nil {
+	if err := verifyPeer(ctx, certs[0].Raw, target); err != nil {
 		return nil, nil, err
 	}
 
@@ -165,6 +183,33 @@ func connectServer(ctx context.Context, server net.Conn, browserCR []byte, targe
 		chain = append(chain, c.Raw)
 	}
 	return tlsConn, chain, nil
+}
+
+// verifyPeer спрашивает ядро, тот ли это сервер.
+//
+// Материал уходит целиком, отпечаток считает ядро. Прислать готовый отпечаток
+// значило бы позволить показать пользователю одно значение, а запомнить
+// другое; здесь мы отпечаток считаем только чтобы назвать сервер в журнале.
+func verifyPeer(ctx context.Context, certDER []byte, target Target) error {
+	if target.VerifyPeer == nil {
+		return ErrNoPeerVerifier
+	}
+	material, err := trust.PeerMaterial(certDER)
+	if err != nil {
+		return err
+	}
+	trusted, err := target.VerifyPeer(ctx, material)
+	if err != nil {
+		return fmt.Errorf("proxy: проверка доверия: %w", err)
+	}
+	if trusted {
+		return nil
+	}
+	if fp, err := trust.Fingerprint(certDER); err == nil {
+		slog.Info("proxy: сервер не подтверждён — ждём решения пользователя",
+			"address", target.Address, "fingerprint", fp)
+	}
+	return ErrPeerNotTrusted
 }
 
 // ReportError сообщает браузеру, что подключение не состоялось.

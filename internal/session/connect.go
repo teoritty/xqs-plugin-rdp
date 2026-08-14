@@ -80,8 +80,9 @@ func parseConnect(raw json.RawMessage) (request, error) {
 	return request{
 		sessionID: p.SessionID,
 		target: proxy.Target{
-			Address:     net.JoinHostPort(host, strconv.Itoa(port)),
-			Fingerprint: strings.TrimSpace(p.Fields["serverFingerprint"]),
+			Address: net.JoinHostPort(host, strconv.Itoa(port)),
+			// VerifyPeer подставляет жизненный цикл: там есть шина к ядру и
+			// идентификатор сессии, а здесь — только разбор параметров.
 			Credentials: credssp.Credentials{
 				Domain:   strings.TrimSpace(p.Fields["domain"]),
 				Username: username,

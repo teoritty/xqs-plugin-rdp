@@ -5,9 +5,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"errors"
+	"encoding/base64"
 	"math/big"
 	"strings"
 	"testing"
@@ -27,6 +28,23 @@ func certDER(t *testing.T, cn string) []byte {
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("сертификат: %v", err)
+	}
+	return der
+}
+
+// certWithKey выпускает сертификат на ЗАДАННОМ ключе — иначе перевыпуск не
+// отличить от смены сервера.
+func certWithKey(t *testing.T, key *ecdsa.PrivateKey, cn string, validFor time.Duration) []byte {
+	t.Helper()
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(validFor),
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -80,108 +98,102 @@ func TestFingerprintRejectsGarbage(t *testing.T) {
 	}
 }
 
-// Главное свойство пакета: пустой пин — отказ, а не «доверяем».
-// Fail-open здесь означал бы, что вся конструкция CredSSP защищает разговор
-// неизвестно с кем.
-func TestEmptyPinIsRefused(t *testing.T) {
+// Главное свойство пакета после переезда решения в ядро: материал, который мы
+// присылаем, и отпечаток, который ядро по нему считает, обязаны сходиться.
+//
+// Ядро считает SHA-256 от присланных байтов и кодирует base64 без паддинга
+// (domain.PeerFingerprint). Если наша Fingerprint однажды начнёт считать от
+// другого материала, пользователь увидит в диалоге одно значение, а в журнале
+// плагина — другое, и сверить их будет нечем.
+func TestFingerprintMatchesWhatTheCoreComputesOverPeerMaterial(t *testing.T) {
 	der := certDER(t, "host")
-	for _, pin := range []string{"", "   ", "\t\n"} {
-		err := trust.Verify(der, pin)
-		if err == nil {
-			t.Fatalf("пустой пин %q принят — политика обязана отказывать по умолчанию", pin)
-		}
-		var unk *trust.UnknownServerError
-		if !errors.As(err, &unk) {
-			t.Fatalf("err типа %T, ожидался *trust.UnknownServerError", err)
-		}
-		// Пользователь обязан увидеть отпечаток: иначе ему нечего вписать в поле.
-		if !strings.Contains(unk.Error(), unk.Fingerprint) {
-			t.Fatalf("текст ошибки не содержит отпечатка: %q", unk.Error())
-		}
-		if !strings.HasPrefix(unk.Fingerprint, "SHA256:") {
-			t.Fatalf("отпечаток в ошибке без префикса: %q", unk.Fingerprint)
-		}
+	material, err := trust.PeerMaterial(der)
+	if err != nil {
+		t.Fatalf("PeerMaterial: %v", err)
+	}
+	sum := sha256.Sum256(material)
+	want := "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
+
+	got, err := trust.Fingerprint(der)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	if got != want {
+		t.Fatalf("отпечаток плагина %q, ядро посчитает %q — пользователю нечего будет сверить", got, want)
 	}
 }
 
-func TestMatchingPinIsAccepted(t *testing.T) {
+// Материал доверия — SubjectPublicKeyInfo, а НЕ содержимое BIT STRING. Это
+// разные значения, и путаница между ними уже однажды стоила живой отладки:
+// привязка CredSSP берёт второе, доверие — первое.
+func TestPeerMaterialIsTheWholeSPKINotTheBareKey(t *testing.T) {
 	der := certDER(t, "host")
-	fp, err := trust.Fingerprint(der)
+	material, err := trust.PeerMaterial(der)
 	if err != nil {
-		t.Fatalf("Fingerprint: %v", err)
+		t.Fatalf("PeerMaterial: %v", err)
 	}
-	if err := trust.Verify(der, fp); err != nil {
-		t.Fatalf("совпавший пин отвергнут: %v", err)
+	bare, err := trust.SubjectPublicKey(der)
+	if err != nil {
+		t.Fatalf("SubjectPublicKey: %v", err)
+	}
+	if bytes.Equal(material, bare) {
+		t.Fatal("материал доверия совпал с материалом привязки — это разные значения")
+	}
+	// SPKI содержит ключ внутри себя вместе с идентификатором алгоритма.
+	if !bytes.Contains(material, bare) {
+		t.Fatal("SPKI не содержит открытого ключа — это не SubjectPublicKeyInfo")
 	}
 }
 
-// Пробелы вокруг вставленного значения — норма при копировании из текста
-// ошибки, и отвергать из-за них было бы придиркой, а не строгостью.
-func TestPinIsTrimmedButNotOtherwiseNormalised(t *testing.T) {
-	der := certDER(t, "host")
-	fp, err := trust.Fingerprint(der)
+// Перевыпуск сертификата с тем же ключом обязан давать тот же материал.
+// Иначе продление срока выглядело бы как смена сервера, и пользователь
+// привык бы подтверждать «смену» не глядя — ровно то, от чего защита нужна.
+func TestPeerMaterialSurvivesCertificateRenewalWithTheSameKey(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("Fingerprint: %v", err)
+		t.Fatalf("ключ: %v", err)
 	}
-	if err := trust.Verify(der, "  "+fp+"\n"); err != nil {
-		t.Fatalf("пин с пробелами отвергнут: %v", err)
+	first := certWithKey(t, key, "host", time.Hour)
+	renewed := certWithKey(t, key, "host", 10*time.Hour)
+	if bytes.Equal(first, renewed) {
+		t.Fatal("сертификаты совпали — тест ничего не проверяет")
 	}
-	// А вот регистр менять нельзя: base64 регистрозависим, и «починить»
-	// отличающийся регистр значило бы принять другой отпечаток.
-	if err := trust.Verify(der, strings.ToUpper(fp)); err == nil {
-		t.Fatal("пин в другом регистре принят — base64 регистрозависим")
+
+	a, err := trust.PeerMaterial(first)
+	if err != nil {
+		t.Fatalf("PeerMaterial: %v", err)
+	}
+	b, err := trust.PeerMaterial(renewed)
+	if err != nil {
+		t.Fatalf("PeerMaterial: %v", err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatal("перевыпуск с тем же ключом сменил материал доверия")
 	}
 }
 
-// Смена ключа сервера обязана быть громкой и отличимой от «пина ещё нет»:
-// первое подозрительно, второе — обычное первое подключение.
-func TestChangedKeyIsDistinctFromMissingPin(t *testing.T) {
-	oldFP, err := trust.Fingerprint(certDER(t, "one"))
+// Смена ключа обязана менять материал: иначе доверие к одному серверу
+// молча распространилось бы на другой.
+func TestPeerMaterialDiffersWhenTheKeyDiffers(t *testing.T) {
+	a, err := trust.PeerMaterial(certDER(t, "one"))
 	if err != nil {
-		t.Fatalf("Fingerprint: %v", err)
+		t.Fatalf("PeerMaterial: %v", err)
 	}
-	newDER := certDER(t, "two")
-
-	err = trust.Verify(newDER, oldFP)
-	if err == nil {
-		t.Fatal("несовпадение обязано быть отказом")
+	b, err := trust.PeerMaterial(certDER(t, "two"))
+	if err != nil {
+		t.Fatalf("PeerMaterial: %v", err)
 	}
-	var mism *trust.MismatchError
-	if !errors.As(err, &mism) {
-		t.Fatalf("err типа %T, ожидался *trust.MismatchError", err)
-	}
-	var unk *trust.UnknownServerError
-	if errors.As(err, &unk) {
-		t.Fatal("несовпадение не должно выглядеть как отсутствие пина: это разные события")
-	}
-	if !strings.Contains(mism.Error(), mism.Expected) || !strings.Contains(mism.Error(), mism.Got) {
-		t.Fatalf("текст не показывает оба отпечатка: %q", mism.Error())
+	if bytes.Equal(a, b) {
+		t.Fatal("разные ключи дали одинаковый материал доверия")
 	}
 }
 
-// Сверяется первый сертификат цепочки — это сертификат сервера. Пустая цепочка
-// не «доверяем по умолчанию», а ошибка.
-func TestVerifyChainUsesLeafAndRejectsEmpty(t *testing.T) {
-	leaf := certDER(t, "leaf")
-	fp, err := trust.Fingerprint(leaf)
-	if err != nil {
-		t.Fatalf("Fingerprint: %v", err)
+func TestPeerMaterialRejectsGarbage(t *testing.T) {
+	if _, err := trust.PeerMaterial([]byte{0xFF, 0xFF}); err == nil {
+		t.Fatal("мусор вместо сертификата обязан быть ошибкой")
 	}
-	chain := [][]byte{leaf, certDER(t, "issuer")}
-	if err := trust.VerifyChain(chain, fp); err != nil {
-		t.Fatalf("цепочка с верным листом отвергнута: %v", err)
-	}
-	if err := trust.VerifyChain(nil, fp); err == nil {
-		t.Fatal("пустая цепочка обязана быть ошибкой")
-	}
-	// Пин от второго сертификата не должен подходить: доверяем листу, а не
-	// «чему-нибудь из цепочки».
-	issuerFP, err := trust.Fingerprint(chain[1])
-	if err != nil {
-		t.Fatalf("Fingerprint: %v", err)
-	}
-	if err := trust.VerifyChain(chain, issuerFP); err == nil {
-		t.Fatal("пин промежуточного сертификата принят вместо листа")
+	if _, err := trust.PeerMaterial(nil); err == nil {
+		t.Fatal("пустой сертификат обязан быть ошибкой")
 	}
 }
 
