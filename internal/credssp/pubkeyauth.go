@@ -61,10 +61,8 @@ func CheckServerVersion(v int) error {
 
 // ClientServerHash считает значение, которое клиент кладёт в pubKeyAuth.
 //
-// pubKey — DER SubjectPublicKeyInfo сертификата сервера, тот же материал, по
-// которому считается отпечаток в internal/trust. Это не совпадение: обе
-// проверки отвечают на один вопрос — тот ли это ключ, — и считать их от разных
-// байтов значило бы проверять два разных утверждения.
+// pubKey — содержимое BIT STRING из SubjectPublicKeyInfo сертификата сервера
+// (trust.SubjectPublicKey). Не SPKI целиком: материал задаёт сервер, а не мы.
 func ClientServerHash(nonce, pubKey []byte) []byte {
 	return bindingHash(clientToServerMagic, nonce, pubKey)
 }

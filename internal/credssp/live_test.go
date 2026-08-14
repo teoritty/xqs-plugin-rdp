@@ -87,7 +87,13 @@ func TestLiveCredSSP(t *testing.T) {
 	t.Logf("TLS: %s, отпечаток сервера %s", tls.VersionName(tlsConn.ConnectionState().Version), fp)
 
 	// 3. CredSSP поверх TLS.
-	err = credssp.Authenticate(tlsConn, certs[0].RawSubjectPublicKeyInfo, credssp.Credentials{
+	// Привязка считается от содержимого BIT STRING, а не от SPKI целиком — см.
+	// trust.SubjectPublicKey.
+	pubKey, err := trust.SubjectPublicKey(certs[0].Raw)
+	if err != nil {
+		t.Fatalf("SubjectPublicKey: %v", err)
+	}
+	err = credssp.Authenticate(tlsConn, pubKey, credssp.Credentials{
 		Domain:   os.Getenv("XQS_RDP_TEST_DOMAIN"),
 		Username: user,
 		Password: []byte(pass),
