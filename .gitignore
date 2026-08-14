@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Release packaging output (cross-compiled binaries, .xqsp bundles, and the
+# generated dev/test-only Ed25519 signing key). None of this is meant to be
+# committed — a real release key belongs in secure infra, not the repo.
+/dist/
+
+# Local agent tooling: not part of the plugin, developer-machine only.
+/.claude/
+/.superpowers/
+/.repowise/
+
+# Local-only reference material: xQuakShell API docs and working notes.
+# Kept on disk for development, deliberately out of the repository.
+/architecture.md
+/plugin-api.md
+/plugin-manifest.md
+/security-model.md
+/docs/
+/API-FINDINGS.md
+
+# Throwaway spike code (phase 0). Never committed.
+/spike/
