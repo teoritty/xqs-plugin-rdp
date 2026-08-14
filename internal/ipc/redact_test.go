@@ -9,10 +9,9 @@ import (
 
 func TestRedactHidesSecretFields(t *testing.T) {
 	in := map[string]any{
-		"username":          "admin",
-		"password":          "hunter2",
-		"domain":            "CORP",
-		"serverFingerprint": "SHA256:abc",
+		"username": "admin",
+		"password": "hunter2",
+		"domain":   "CORP",
 	}
 	out := ipc.Redact(in)
 	if out["password"] == "hunter2" {
@@ -21,10 +20,11 @@ func TestRedactHidesSecretFields(t *testing.T) {
 	if out["username"] != "admin" {
 		t.Fatal("username не секрет, его резать не надо")
 	}
-	// Отпечаток обязан оставаться видимым: он и существует, чтобы человек его
-	// прочитал и сверил.
-	if out["serverFingerprint"] != "SHA256:abc" {
-		t.Fatalf("serverFingerprint = %v, он не секрет", out["serverFingerprint"])
+	// Список секретов — перечень того, что резать, а не того, что пропускать:
+	// незнакомый ключ обязан доехать до лога как есть, иначе диагностировать
+	// новый метод будет нечем.
+	if out["domain"] != "CORP" {
+		t.Fatalf("domain = %v, он не секрет", out["domain"])
 	}
 }
 

@@ -89,7 +89,7 @@ func TestManifestFieldsCoverAuthAndTrust(t *testing.T) {
 			seen[fm["id"].(string)] = fm
 		}
 	}
-	for _, id := range []string{"username", "password", "domain", "serverFingerprint"} {
+	for _, id := range []string{"username", "password", "domain"} {
 		if _, ok := seen[id]; !ok {
 			t.Fatalf("поле %q отсутствует", id)
 		}
@@ -100,10 +100,11 @@ func TestManifestFieldsCoverAuthAndTrust(t *testing.T) {
 	if seen["password"]["type"] != "password" {
 		t.Fatalf("password type = %v", seen["password"]["type"])
 	}
-	// Отпечаток не секрет — он существует ровно затем, чтобы человек его
-	// прочитал и сверил.
-	if seen["serverFingerprint"]["secret"] == true {
-		t.Fatal("serverFingerprint не должен быть secret")
+	// Доверие к серверу больше не поле формы: его помнит ядро, а спрашивает —
+	// диалогом. Поле, оставшееся в манифесте, снова просило бы у пользователя
+	// то, чего у него больше не спрашивают.
+	if _, ok := seen["serverFingerprint"]; ok {
+		t.Fatal("в манифесте осталось поле serverFingerprint — доверие переехало в ядро")
 	}
 }
 

@@ -18,6 +18,9 @@ type fakeHost struct {
 	mu     sync.Mutex
 	calls  []call
 	failOn map[string]error
+	// results — ответы хоста по методам. Нужны там, где ответ несёт решение:
+	// у trust.verifyPeer от него зависит, пойдёт ли дальше пароль.
+	results map[string]any
 }
 
 type call struct {
@@ -25,17 +28,46 @@ type call struct {
 	params any
 }
 
-func newFakeHost() *fakeHost { return &fakeHost{failOn: map[string]error{}} }
+func newFakeHost() *fakeHost {
+	return &fakeHost{failOn: map[string]error{}, results: map[string]any{}}
+}
 
-func (h *fakeHost) Call(_ context.Context, method string, params, _ any) error {
+func (h *fakeHost) Call(_ context.Context, method string, params, result any) error {
 	h.mu.Lock()
 	h.calls = append(h.calls, call{method: method, params: params})
 	err := h.failOn[method]
+	res, hasRes := h.results[method]
 	h.mu.Unlock()
-	return err
+	if err != nil {
+		return err
+	}
+	if !hasRes || result == nil {
+		return nil
+	}
+	// Через JSON, а не присваиванием: так же, как это делает настоящая шина,
+	// и тег поля проверяется заодно.
+	raw, err := json.Marshal(res)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, result)
 }
 
 func (h *fakeHost) Notify(string, any) error { return nil }
+
+// callsTo отбирает вызовы одного метода — вместе с параметрами, потому что у
+// доверия проверять надо именно их.
+func (h *fakeHost) callsTo(method string) []call {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []call
+	for _, c := range h.calls {
+		if c.method == method {
+			out = append(out, c)
+		}
+	}
+	return out
+}
 
 func (h *fakeHost) methods() []string {
 	h.mu.Lock()
@@ -116,10 +148,9 @@ func validParams() map[string]any {
 		"host":      "192.168.31.38",
 		"port":      3389,
 		"fields": map[string]string{
-			"username":          "admin",
-			"password":          "hunter2",
-			"domain":            "CORP",
-			"serverFingerprint": "SHA256:abc",
+			"username": "admin",
+			"password": "hunter2",
+			"domain":   "CORP",
 		},
 	}
 }
@@ -202,8 +233,11 @@ func TestConnectBuildsTargetFromHostFields(t *testing.T) {
 	if parsed.target.Address != "192.168.31.38:3389" {
 		t.Fatalf("Address = %q", parsed.target.Address)
 	}
-	if parsed.target.Fingerprint != "SHA256:abc" {
-		t.Fatalf("Fingerprint = %q", parsed.target.Fingerprint)
+	// Разбор параметров доверие не назначает: его подключает жизненный цикл,
+	// у которого есть шина к ядру. Цель, собранная здесь, обязана быть
+	// непригодной к подключению до этого момента.
+	if parsed.target.VerifyPeer != nil {
+		t.Fatal("разбор параметров назначил проверку доверия сам")
 	}
 	if parsed.target.Credentials.Username != "admin" || parsed.target.Credentials.Domain != "CORP" {
 		t.Fatalf("Credentials = %+v", parsed.target.Credentials)

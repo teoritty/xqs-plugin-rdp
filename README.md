@@ -74,13 +74,32 @@ the honest version of the same state.
 ## Server certificate trust
 
 RDP servers are almost always self-signed, and CredSSP's channel binding is only
-worth anything if you know whose key you are bound to. The first connection to a
-server therefore **fails**, showing the server's SPKI fingerprint; paste it into
-the connection's *Server key fingerprint* field to trust that server. A
-fingerprint that later changes fails loudly.
+worth anything if you know whose key you are bound to. So before any credential
+leaves this process, the plugin asks the core whether the server on the other end
+is one you have already trusted.
 
-This is `StrictHostKeyChecking=yes` behaviour rather than trust-on-first-use,
-because a plugin has nowhere durable to record what it has seen before.
+The plugin sends the server's SubjectPublicKeyInfo and gets back yes or no. On
+"no" the core shows you the fingerprint and asks; your answer is recorded there,
+and the connection retries on its own. Nothing about that decision is stored in
+the plugin or in the connection's fields — a plugin runs with `per-session`
+isolation and has nowhere durable to keep it, and a field you fill in by hand is
+a question asked in the wrong place.
+
+Trust is remembered per address (`host:port`) within this plugin, the way
+`known_hosts` remembers a host rather than a saved connection. Two connections
+pointing at the same server share it. A key that later changes is a different
+question with different wording, not a repeat of the first one.
+
+The material is the SubjectPublicKeyInfo, not the whole certificate: a server may
+reissue a certificate with the same key, and asking you to re-confirm that would
+train you to confirm key changes without looking — the exact habit this protects
+against.
+
+Older versions of this plugin had a *Server key fingerprint* field on the
+connection form. It is gone; nothing needs to be migrated, and connections that
+still carry a value for it simply ignore it. This requires a core with the peer
+trust service (`trust.verifyPeer`); on an older core the connection fails with a
+capability error rather than proceeding unverified.
 
 ## License
 

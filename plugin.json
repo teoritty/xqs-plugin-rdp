@@ -70,22 +70,6 @@
                 "required": true
               }
             ]
-          },
-          {
-            "id": "trust",
-            "label": "Server trust",
-            "order": 2,
-            "fields": [
-              {
-                "id": "serverFingerprint",
-                "label": "Server key fingerprint",
-                "description": "SHA-256 fingerprint of the server's public key. Leave empty on the first attempt: the connection is refused and the fingerprint is shown, so you can verify it and paste it here.",
-                "type": "text",
-                "width": "full",
-                "order": 1,
-                "secret": false
-              }
-            ]
           }
         ]
       }
