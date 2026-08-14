@@ -114,8 +114,10 @@ async function main() {
     .setCursorStyleCallback(setCursorStyle)
     .setCursorStyleCallbackContext({})
     // Точка отсечения: браузер не запрашивает NLA и не пытается его вести.
-    // Плагин отвечает ему Connect Confirm с selected = SSL, и клиент уходит
-    // прямо в MCS. Снять этот флаг — значит сломать всю схему.
+    // Отсюда следует и то, что клиент объявляет ТОЛЬКО SSL и отвергает ответ
+    // с любым другим протоколом. Поэтому плагин отвечает ему selected = SSL, а
+    // серверу правит одно поле в первом MCS-сообщении — см. internal/proxy/mcs.go.
+    // Снять этот флаг — значит сломать всю схему.
     .extension(enableCredssp(false));
 
   const session = await builder.connect();
@@ -141,14 +143,32 @@ function setCursorStyle(kind, dataUrl, hotspotX, hotspotY) {
 }
 
 main().catch((e) => {
-  // IronError несёт kind() и, для RDCleanPath, подробности. Показать их важнее,
-  // чем скрыть: без них пользователь видит пустой экран и ничего больше.
-  let detail = String(e);
-  try {
-    if (e && typeof e.kind === 'function') detail += ` (kind=${e.kind()})`;
-  } catch (_) {
-    // kind() у не-IronError отсутствует — это не повод терять исходную ошибку.
-  }
+  // IronError несёт backtrace() с настоящей причиной, kind() и, для
+  // RDCleanPath, подробности. Показать их важнее, чем скрыть: без них
+  // пользователь видит пустой экран и ничего больше.
+  //
+  // backtrace() здесь первый и обязательный. String(e) на IronError даёт
+  // «[object Object]» — ровно это и было показано, когда клиент отвергал
+  // ответ прокси, и причина («client advertised SSL, but server selected
+  // HYBRID») стоила отдельного стенда, чтобы её увидеть.
   console.error(e);
-  setStatus(detail, true);
+  setStatus(describeError(e), true);
 });
+
+function describeError(e) {
+  const parts = [];
+  try {
+    if (e && typeof e.backtrace === 'function') parts.push(e.backtrace());
+  } catch (_) {
+    // Не IronError — берём то, что есть, ниже.
+  }
+  try {
+    if (e && typeof e.kind === 'function') parts.push(`kind=${e.kind()}`);
+  } catch (_) {
+    // То же самое.
+  }
+  if (parts.length === 0) {
+    parts.push(e && e.message ? e.message : String(e));
+  }
+  return parts.join(' | ');
+}
