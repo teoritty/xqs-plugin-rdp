@@ -32,6 +32,22 @@ func NewSendWindow(initial int) *SendWindow {
 	return w
 }
 
+// TryAcquire забирает кредит, если он есть прямо сейчас, и никогда не ждёт.
+//
+// Существует ради горячего пути: при работающей сессии кредит обычно есть, а
+// полный Acquire ради этого поднимает сторожевую горутину и канал — на каждый
+// кадр. При всплеске кадров это тысячи горутин в секунду, то есть работа
+// сборщика ровно в тот момент, когда её меньше всего ждут.
+func (w *SendWindow) TryAcquire() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.credit <= 0 {
+		return false
+	}
+	w.credit--
+	return true
+}
+
 // Acquire забирает один кредит, ожидая при необходимости.
 //
 // Ожидание прерывается отменой контекста и закрытием окна. Первое важно не
@@ -40,6 +56,9 @@ func NewSendWindow(initial int) *SendWindow {
 func (w *SendWindow) Acquire(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if w.TryAcquire() {
+		return nil
 	}
 
 	// sync.Cond не умеет просыпаться по контексту, поэтому будим его сами.

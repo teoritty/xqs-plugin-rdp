@@ -15,6 +15,11 @@ import (
 // Порт, а не прямая зависимость от ipc: он позволяет проверять Conn на фейке,
 // без шины и без хоста, — а поверх Conn работает crypto/tls, которому нужен
 // именно настоящий net.Conn, а не заглушка.
+//
+// КОНТРАКТ: payload действителен только на время вызова. Отправитель обязан
+// записать его синхронно либо скопировать сам. Это записано здесь, потому что
+// на другой стороне контракта — горячий путь: копия на каждый кадр стоила
+// 32 КБ мусора на кадр и заметной просадки при всплеске.
 type FrameSender interface {
 	SendChannelFrame(channelID uint32, payload []byte) error
 }
@@ -140,11 +145,9 @@ func (c *Conn) Write(b []byte) (int, error) {
 		if err := c.acquireWriteCredit(); err != nil {
 			return written, err
 		}
-		// Копия обязательна: вызывающий вправе переиспользовать свой буфер
-		// сразу после возврата, а фрейм уйдёт по шине позже.
-		frame := make([]byte, len(chunk))
-		copy(frame, chunk)
-		if err := c.send.SendChannelFrame(c.channelID, frame); err != nil {
+		// Без копии: по контракту FrameSender фрейм уходит синхронно, а до
+		// возврата из Write наш вызывающий свой буфер не трогает.
+		if err := c.send.SendChannelFrame(c.channelID, chunk); err != nil {
 			return written, c.opError("write", err)
 		}
 		written = end
@@ -153,7 +156,17 @@ func (c *Conn) Write(b []byte) (int, error) {
 }
 
 // acquireWriteCredit ждёт кредита, соблюдая дедлайн записи и закрытие.
+//
+// Быстрый путь отдельно от медленного намеренно. При живой сессии кредит есть
+// почти всегда, а медленный путь на каждый кадр поднимает контекст, сторожевую
+// горутину и канал. Дедлайн при этом не теряется: не дождавшись кредита сразу,
+// мы уходим в полный путь, где он соблюдается, — а Write уже проверил
+// истёкший дедлайн на входе.
 func (c *Conn) acquireWriteCredit() error {
+	if c.sendWin.TryAcquire() {
+		return nil
+	}
+
 	ctx, cancel := context.WithCancel(c.writeCtx)
 	defer cancel()
 
