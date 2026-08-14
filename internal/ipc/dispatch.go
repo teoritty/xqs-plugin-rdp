@@ -161,3 +161,13 @@ func (d *Dispatcher) Notify(method string, params any) error {
 	defer d.mu.Unlock()
 	return WriteFrame(d.w, Frame{Kind: KindJSONRPC, ChannelID: 0, Payload: body})
 }
+
+// Handles сообщает, зарегистрирован ли обработчик метода.
+//
+// Нужен тестам контракта: пропущенный метод сессии означает -32601 на
+// сообщение, которое хост считает обязательным, и заметить это в рантайме
+// дороже, чем проверить один раз.
+func (d *Dispatcher) Handles(method string) bool {
+	_, ok := d.handlers[method]
+	return ok
+}

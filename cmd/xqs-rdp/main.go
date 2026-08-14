@@ -11,6 +11,8 @@ import (
 
 	"xqs-plugin-rdp/internal/ipc"
 	"xqs-plugin-rdp/internal/lifecycle"
+	"xqs-plugin-rdp/internal/session"
+	"xqs-plugin-rdp/internal/transport"
 )
 
 func main() {
@@ -24,8 +26,18 @@ func main() {
 }
 
 func run() int {
-	manager := lifecycle.NewManager()
 	dispatcher := ipc.NewDispatcher(os.Stdout)
+
+	// Транспорт зовёт хост и шлёт байты; сессия зовёт хост и открывает каналы.
+	// Оба принимают интерфейсы, и здесь — единственное место, где становится
+	// видно, что за ними стоит один и тот же диспетчер.
+	channels := transport.NewManager(dispatcher)
+	dispatcher.OnChannel(channels.OnFrame)
+
+	sessions := session.NewManager(dispatcher, channels)
+	sessions.Register(dispatcher)
+
+	manager := lifecycle.NewManager()
 	manager.Register(dispatcher)
 
 	served := make(chan error, 1)
@@ -33,10 +45,13 @@ func run() int {
 
 	select {
 	case <-manager.Done():
-		// Штатное завершение по shutdown от ядра.
+		// Штатное завершение по shutdown от ядра. Каналы закрываем сами:
+		// ядро уже не ждёт от нас сообщений, но горутины релея ждут закрытия.
 		slog.Info("xqs-rdp: shutdown requested, exiting")
+		channels.CloseAll()
 		return 0
 	case err := <-served:
+		channels.CloseAll()
 		return exitCodeFor(err)
 	}
 }
