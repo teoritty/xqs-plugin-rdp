@@ -55,6 +55,22 @@ The Go side depends on [`bodgit/ntlmssp`](https://github.com/bodgit/ntlmssp)
 for NTLM with signing, sealing and channel bindings — the parts CredSSP needs.
 CredSSP itself has no ready-made Go implementation and is written here.
 
+## Building
+
+    go test ./...
+    go run ./cmd/xqs-rdp-pack
+
+The second command cross-compiles for six platforms and writes an installable
+`.xqsp` bundle per platform into `dist/`. Add `-only windows/amd64` to build
+just one.
+
+Bundles are **unsigned**. The host's signature is Ed25519 over a canonical JSON
+envelope containing its own `plugin.Manifest` Go struct, so signing from outside
+the core means reproducing that struct field for field — which would keep
+working right up until the core changes it, and then fail silently rather than
+loudly. An unsigned bundle installs with a visible "unsigned" notice, which is
+the honest version of the same state.
+
 ## Server certificate trust
 
 RDP servers are almost always self-signed, and CredSSP's channel binding is only
