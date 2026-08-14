@@ -31,6 +31,30 @@ Deliberately excluded, each for a stated reason:
 | Audio, drive and printer redirection | Out of scope; drive redirection in particular hands the remote machine access to local files. |
 | RD Gateway, Hyper-V VMConnect, multi-monitor | Out of scope. |
 
+## Third-party code
+
+The viewer is [IronRDP](https://github.com/Devolutions/IronRDP)'s WebAssembly
+web client, vendored under `ui/vendor/ironrdp/`:
+
+| Package | Version |
+|---|---|
+| `@devolutions/iron-remote-desktop` | 0.11.0 |
+| `@devolutions/iron-remote-desktop-rdp` | 0.7.0 |
+
+Both are `MIT OR Apache-2.0`, which is compatible with this plugin's GPL-3.0;
+the licence text is kept alongside the bundle. The RDP package is ~6.1 MB
+because the WebAssembly module is embedded in it — that is the cost of not
+writing an RDP stack from scratch.
+
+It is vendored rather than downloaded during the build so that the release
+signature covers exactly the bytes that were reviewed. `SHA256SUMS` in that
+directory pins them; `VERSION` records where they came from and what to check
+when updating.
+
+The Go side depends on [`bodgit/ntlmssp`](https://github.com/bodgit/ntlmssp)
+for NTLM with signing, sealing and channel bindings — the parts CredSSP needs.
+CredSSP itself has no ready-made Go implementation and is written here.
+
 ## Server certificate trust
 
 RDP servers are almost always self-signed, and CredSSP's channel binding is only
