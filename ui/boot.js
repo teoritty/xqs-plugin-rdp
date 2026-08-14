@@ -181,7 +181,7 @@ async function main() {
 
   userInteraction.onWarningCallback((text) => console.warn('ironrdp:', text));
 
-  await userInteraction.connect(config);
+  const session = await userInteraction.connect(config);
   setStatus('');
 
   // Видимость компонент сам не включает — это делает хост.
@@ -196,6 +196,15 @@ async function main() {
   focusSession(sessionEl);
 
   applyViewport();
+
+  // run() — активная фаза: именно в ней кадры декодируются и попадают на
+  // канвас. Без неё подключение завершается успешно, сервер шлёт обновления,
+  // а экран остаётся чёрным — connect() поднимает сессию, но не крутит её.
+  //
+  // Ждём здесь: возврат означает, что сессия закончилась, и пользователю
+  // нужно сказать почему.
+  const termination = await session.run();
+  setStatus(`Session ended: ${termination.reason()}`);
 }
 
 // focusSession отдаёт фокус компоненту и возвращает его после переключения
