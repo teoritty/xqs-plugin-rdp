@@ -92,14 +92,13 @@ func Handshake(ctx context.Context, browser, server net.Conn, target Target) (ne
 			"browserDestination", req.Destination, "hostDestination", target.Address)
 	}
 
-	serverTLS, chain, err := connectServer(ctx, server, req.X224, target)
+	leg, err := connectServer(ctx, server, req.X224, target)
 	if err != nil {
 		return nil, err
 	}
+	serverTLS := leg.tls
 
-	// Ответ браузеру: Connect Confirm с selected = SSL. С этого момента он
-	// считает, что NLA не выбран, и уходит прямо в MCS.
-	resp, err := cleanpath.BuildResponse(x224.ConnectConfirmForBrowser(), chain, target.Address)
+	resp, err := browserResponse(leg, target.Address)
 	if err != nil {
 		return nil, err
 	}
@@ -125,28 +124,42 @@ func readRequest(browser net.Conn) (cleanpath.Request, error) {
 	return req, nil
 }
 
+// serverLeg — серверная половина, доведённая до готовности к релею.
+//
+// Структура, а не три возврата подряд: connectConfirm и chain — это разные
+// вещи одинакового вида ([]byte и [][]byte легко перепутать местами глазами,
+// хоть и не компилятором), и обе уезжают браузеру в одном ответе.
+type serverLeg struct {
+	tls   net.Conn
+	chain [][]byte
+	// connectConfirm — ответ сервера на Connection Request, как он пришёл.
+	// Уезжает браузеру без правок: в нём выбранный протокол, по которому
+	// клиент заполняет clientCoreData.
+	connectConfirm []byte
+}
+
 // connectServer доводит серверную половину до готового к релею TLS-потока.
-func connectServer(ctx context.Context, server net.Conn, browserCR []byte, target Target) (net.Conn, [][]byte, error) {
+func connectServer(ctx context.Context, server net.Conn, browserCR []byte, target Target) (serverLeg, error) {
 	// 1. X.224: просим у сервера NLA, что бы ни просил браузер.
 	cr, err := x224.RewriteRequestForServer(browserCR)
 	if err != nil {
-		return nil, nil, fmt.Errorf("proxy: перезапись Connection Request: %w", err)
+		return serverLeg{}, fmt.Errorf("proxy: перезапись Connection Request: %w", err)
 	}
 	if _, err := server.Write(cr); err != nil {
-		return nil, nil, fmt.Errorf("proxy: отправка Connection Request: %w", err)
+		return serverLeg{}, fmt.Errorf("proxy: отправка Connection Request: %w", err)
 	}
 	raw, err := x224.ReadPDU(server)
 	if err != nil {
-		return nil, nil, fmt.Errorf("proxy: чтение Connection Confirm: %w", err)
+		return serverLeg{}, fmt.Errorf("proxy: чтение Connection Confirm: %w", err)
 	}
 	cc, err := x224.ParseConnectConfirm(raw)
 	if err != nil {
 		// NegotiationFailure долетает сюда как есть: у него внутри код, по
 		// которому пользователь поймёт, что делать.
-		return nil, nil, fmt.Errorf("proxy: %w", err)
+		return serverLeg{}, fmt.Errorf("proxy: %w", err)
 	}
 	if err := x224.RequireHybrid(cc.Selected); err != nil {
-		return nil, nil, fmt.Errorf("proxy: %w", err)
+		return serverLeg{}, fmt.Errorf("proxy: %w", err)
 	}
 
 	// 2. TLS. Проверку цепочки средствами crypto/tls отключаем осознанно:
@@ -157,32 +170,55 @@ func connectServer(ctx context.Context, server net.Conn, browserCR []byte, targe
 		MinVersion:         tls.VersionTLS12,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return nil, nil, fmt.Errorf("proxy: TLS с сервером: %w", err)
+		return serverLeg{}, fmt.Errorf("proxy: TLS с сервером: %w", err)
 	}
 	certs := tlsConn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
-		return nil, nil, errors.New("proxy: сервер не прислал сертификат")
+		return serverLeg{}, errors.New("proxy: сервер не прислал сертификат")
 	}
 
 	// 3. Кто на том конце. До CredSSP, а не после.
 	if err := verifyPeer(ctx, certs[0].Raw, target); err != nil {
-		return nil, nil, err
+		return serverLeg{}, err
 	}
 
 	// 4. NLA. Пароль дальше этой функции не уходит.
 	pubKey, err := trust.SubjectPublicKey(certs[0].Raw)
 	if err != nil {
-		return nil, nil, err
+		return serverLeg{}, err
 	}
 	if err := credssp.Authenticate(tlsConn, pubKey, target.Credentials); err != nil {
-		return nil, nil, err
+		return serverLeg{}, err
 	}
 
 	chain := make([][]byte, 0, len(certs))
 	for _, c := range certs {
 		chain = append(chain, c.Raw)
 	}
-	return tlsConn, chain, nil
+	return serverLeg{tls: tlsConn, chain: chain, connectConfirm: raw}, nil
+}
+
+// browserResponse собирает RDCleanPath-ответ браузеру.
+//
+// Connect Confirm уходит НАСТОЯЩИЙ, байт в байт от сервера.
+//
+// Раньше здесь собирался синтетический ответ с selected = SSL — чтобы клиент
+// пропустил NLA. Это оказалось и лишним, и вредным. Лишним: NLA страница
+// отключает флагом enableCredssp(false), и выбранный протокол на это не
+// влияет. Вредным: клиент кладёт selected в clientCoreData полем
+// server_selected_protocol, и сервер, выбравший HYBRID, обрывает соединение на
+// первом же MCS-сообщении, получив от клиента SSL. Снаружи это выглядело как
+// «висит на authenticating», потому что рвётся уже после точки отсечения.
+//
+// После неё браузер говорит с настоящим сервером через наш релей — значит и
+// возможности из ответа сервера настоящие, и обнулять их значило бы соврать о
+// собеседнике второй раз.
+func browserResponse(leg serverLeg, addr string) ([]byte, error) {
+	resp, err := cleanpath.BuildResponse(leg.connectConfirm, leg.chain, addr)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // verifyPeer спрашивает ядро, тот ли это сервер.
