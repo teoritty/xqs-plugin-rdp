@@ -1,0 +1,39 @@
+IronRDP web client — vendored bundle
+====================================
+
+Source packages (npm), pinned:
+
+  @devolutions/iron-remote-desktop      0.11.0
+  @devolutions/iron-remote-desktop-rdp  0.7.0
+
+Upstream:  https://github.com/Devolutions/IronRDP
+Licence:   MIT OR Apache-2.0  (see LICENSE-MIT next to this file)
+Vendored:  2026-08-14
+
+`iron-remote-desktop-rdp.js` is ~6.1 MB because the WebAssembly module is
+embedded in it. That size is the price of not writing an RDP stack, and it is
+paid once per release rather than per session.
+
+Why vendored rather than fetched at build time
+----------------------------------------------
+
+The bundle ships inside the signed `.xqsp` and is served to the browser by the
+host's embed broker. A build-time download would put a network fetch between
+"what we reviewed" and "what the user runs"; keeping the bytes in the
+repository means the signature covers exactly what was reviewed.
+
+The `.d.ts` files are vendored alongside the code deliberately. They are not
+needed at runtime, but they are the only documentation of this API that is
+guaranteed to match the pinned version, and the 0.x series changes shape
+between minor releases.
+
+Verifying and updating
+----------------------
+
+    sha256sum -c SHA256SUMS
+
+To update, re-install the pinned versions, copy the four files here, and
+regenerate SHA256SUMS. Read the upstream changelog first: this is a 0.x
+package, and a breaking change between minor versions is normal rather than
+exceptional. In particular, `enableCredssp(false)` must keep working — the
+plugin's entire security model rests on the browser not performing NLA.
