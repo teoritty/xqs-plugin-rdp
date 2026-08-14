@@ -85,16 +85,29 @@ type Credentials struct {
 // SubjectPublicKeyInfo сертификата сервера, тот же материал, по которому
 // internal/trust считает отпечаток.
 //
-// Порядок обмена (MS-CSSP 3.1.5):
+// Порядок обмена (MS-CSSP 3.1.5), три сообщения от нас и два от сервера:
 //
-//	1..3. NTLM negotiate/challenge/authenticate внутри negoTokens
-//	4.    клиент шлёт clientNonce + pubKeyAuth = Wrap(ClientServerHash)
-//	5.    сервер отвечает pubKeyAuth = Wrap(ServerClientHash) — проверяем
-//	6.    клиент шлёт authInfo = Wrap(TSCredentials)
+//  1. клиент → negoTokens[NTLM NEGOTIATE]
+//  2. сервер → negoTokens[NTLM CHALLENGE]
+//  3. клиент → negoTokens[NTLM AUTHENTICATE] + clientNonce + pubKeyAuth
+//  4. сервер → pubKeyAuth = Wrap(ServerClientHash)
+//  5. клиент → authInfo = Wrap(TSCredentials)
 //
-// Шаг 5 — не формальность: он доказывает, что тот, кто владеет ключом сессии
+// Ключевая тонкость — шаг 3: AUTHENTICATE и pubKeyAuth едут в ОДНОМ TSRequest.
+// Отправить AUTHENTICATE отдельно и ждать ответа нельзя: сервер отвечает только
+// после того, как получит привязку, и обе стороны встают в ожидание. Проверено
+// на живом сервере — с неверным паролем этого не видно, потому что сервер
+// отвечает отказом сразу, и дефект проявляется ровно тогда, когда
+// аутентификация проходит.
+//
+// Шаг 4 — не формальность: он доказывает, что тот, кто владеет ключом сессии
 // NTLM, владеет и ключом сертификата. Пропустить его значит согласиться, что
 // между нами и сервером мог стоять кто угодно.
+//
+// Обмен расписан явно, а не циклом «пока не завершено»: у NTLM ровно три
+// сообщения, и обобщённый цикл лишь притворялся бы, что их может быть больше,
+// раскладывая при этом настоящие три неверно. Kerberos с его переменным числом
+// шагов — отдельная фаза и отдельная функция.
 func Authenticate(rw io.ReadWriter, serverPubKey []byte, creds Credentials) error {
 	if len(serverPubKey) == 0 {
 		return errors.New("credssp: пустой открытый ключ сервера")
@@ -108,53 +121,45 @@ func Authenticate(rw io.ReadWriter, serverPubKey []byte, creds Credentials) erro
 		return fmt.Errorf("credssp: инициализация NTLM: %w", err)
 	}
 
-	// Шаг 1: NTLM Negotiate.
-	token, err := client.Authenticate(nil, nil)
+	// Шаг 1: NTLM NEGOTIATE.
+	negotiate, err := client.Authenticate(nil, nil)
 	if err != nil {
 		return fmt.Errorf("credssp: NTLM negotiate: %w", err)
 	}
-
-	var serverVersion int
-	for {
-		if err := writeTSRequest(rw, TSRequest{Version: Version, NegoToken: token}); err != nil {
-			return err
-		}
-		resp, err := readTSRequest(rw)
-		if err != nil {
-			return err
-		}
-		if resp.HasError {
-			return &ErrRejected{Code: uint32(resp.ErrorCode)}
-		}
-		// Версию сервер сообщает в первом же ответе; проверяем сразу, чтобы не
-		// доводить обмен до конца с непропатченным сервером.
-		if serverVersion == 0 {
-			serverVersion = resp.Version
-			if err := CheckServerVersion(serverVersion); err != nil {
-				return err
-			}
-		}
-		if client.Complete() {
-			break
-		}
-		if len(resp.NegoToken) == 0 {
-			return errors.New("credssp: сервер не прислал NTLM-токен, а обмен не завершён")
-		}
-		token, err = client.Authenticate(resp.NegoToken, nil)
-		if err != nil {
-			return fmt.Errorf("credssp: NTLM: %w", err)
-		}
-		if len(token) == 0 {
-			return errors.New("credssp: NTLM не дал токена, а обмен не завершён")
-		}
+	if err := writeTSRequest(rw, TSRequest{Version: Version, NegoToken: negotiate}); err != nil {
+		return err
 	}
 
+	// Шаг 2: NTLM CHALLENGE.
+	challenge, err := readTSRequest(rw)
+	if err != nil {
+		return err
+	}
+	if challenge.HasError {
+		return &ErrRejected{Code: uint32(challenge.ErrorCode)}
+	}
+	// Версию сервер сообщает в первом же ответе; проверяем сразу, чтобы не
+	// доводить обмен до конца с непропатченным сервером.
+	if err := CheckServerVersion(challenge.Version); err != nil {
+		return err
+	}
+	if len(challenge.NegoToken) == 0 {
+		return errors.New("credssp: сервер не прислал NTLM CHALLENGE")
+	}
+
+	// Шаг 3: NTLM AUTHENTICATE вместе с привязкой к ключу — одним сообщением.
+	authenticate, err := client.Authenticate(challenge.NegoToken, nil)
+	if err != nil {
+		return fmt.Errorf("credssp: NTLM authenticate: %w", err)
+	}
+	if !client.Complete() {
+		return errors.New("credssp: NTLM не завершился за три сообщения")
+	}
 	session := client.SecuritySession()
 	if session == nil {
 		return errors.New("credssp: NTLM завершён без сессионной безопасности — нечем шифровать учётные данные")
 	}
 
-	// Шаг 4: привязка к открытому ключу сервера.
 	nonce, err := NewNonce()
 	if err != nil {
 		return err
@@ -165,13 +170,14 @@ func Authenticate(rw io.ReadWriter, serverPubKey []byte, creds Credentials) erro
 	}
 	if err := writeTSRequest(rw, TSRequest{
 		Version:     Version,
+		NegoToken:   authenticate,
 		PubKeyAuth:  sealedHash,
 		ClientNonce: nonce,
 	}); err != nil {
 		return err
 	}
 
-	// Шаг 5: сервер обязан доказать владение ключом.
+	// Шаг 4: сервер обязан доказать владение ключом.
 	resp, err := readTSRequest(rw)
 	if err != nil {
 		return err
@@ -190,7 +196,7 @@ func Authenticate(rw io.ReadWriter, serverPubKey []byte, creds Credentials) erro
 		return err
 	}
 
-	// Шаг 6: учётные данные. Открытая форма живёт ровно до шифрования.
+	// Шаг 5: учётные данные. Открытая форма живёт ровно до шифрования.
 	plain, err := EncodeCredentials(creds.Domain, creds.Username, creds.Password)
 	if err != nil {
 		return err
