@@ -7,11 +7,20 @@
 // и попасть не может — NLA целиком выполняет плагин, а браузер подключается к
 // уже аутентифицированному потоку. Всё, что здесь есть, — адрес туннеля и
 // заглушки вместо учётных данных.
+//
+// Работа идёт через штатный веб-компонент <iron-remote-desktop>, а не через
+// низкоуровневый SessionBuilder. Это не стилистика: компонент несёт всю
+// обвязку ввода — мышь, колесо, клавиатуру со скан-кодами, залипающие
+// модификаторы, отпускание клавиш при потере фокуса. Собранная вручную
+// страница картинку показывала, но ввода не имела вовсе, а таблицу скан-кодов
+// пришлось бы писать заново рядом с уже существующей.
 
 import { init, Backend, enableCredssp } from './vendor/ironrdp/iron-remote-desktop-rdp.js';
+// Импорт ради побочного эффекта: модуль регистрирует <iron-remote-desktop>.
+import './vendor/ironrdp/iron-remote-desktop.js';
 
 const statusEl = document.getElementById('status');
-const canvasEl = document.getElementById('screen');
+const mountEl = document.getElementById('session');
 
 function setStatus(text, isError) {
   if (!statusEl) return;
@@ -49,43 +58,71 @@ function tunnelUrlFromLocation() {
   return `${scheme}//${window.location.host}${marker}${token}/tunnel/main`;
 }
 
+// Размер панели, о котором последним сообщил хост, и живой пульт компонента.
+//
+// Слушатель сообщений ставится ДО подключения намеренно: хост присылает
+// embed.viewport сразу после монтирования панели, то есть раньше, чем
+// поднимется сессия. Пропустив это сообщение, мы запросили бы у сервера размер
+// по умолчанию, и первое, что увидел бы пользователь, — рабочий стол не того
+// разрешения, натянутый на панель.
+let viewport = null;
+let userInteraction = null;
+
+function currentViewport() {
+  const width = (viewport && viewport.widthPx) || window.innerWidth;
+  const height = (viewport && viewport.heightPx) || window.innerHeight;
+  const scale = (viewport && viewport.devicePixelRatio) || window.devicePixelRatio || 1;
+  return { width: clampDesktop(width), height: clampDesktop(height), scale };
+}
+
+/**
+ * clampDesktop приводит размер к тому, что RDP согласен считать разрешением.
+ *
+ * Чётность обязательна, а нижняя граница существует потому, что узкая панель
+ * (свёрнутая вкладка, перетаскиваемый разделитель) иначе превратилась бы в
+ * запрос вроде 40x10 — на такое сервер отвечает отказом, и вместо картинки
+ * пользователь получил бы разорванную сессию.
+ */
+function clampDesktop(value) {
+  const v = Math.floor(Number(value) || 0);
+  const bounded = Math.min(Math.max(v, 200), 4096);
+  return bounded - (bounded % 2);
+}
+
 // Хост общается со страницей через postMessage. Документированы ровно три
 // сообщения; всё остальное игнорируем молча, а не «на всякий случай
 // обрабатываем».
-function listenToHost(session) {
-  window.addEventListener('message', (event) => {
-    const data = event.data;
-    if (!data || data.source !== 'xquakshell-host') return;
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data || data.source !== 'xquakshell-host') return;
 
-    switch (data.type) {
-      case 'embed.viewport':
-        applyViewport(session, data);
-        break;
-      case 'embed.suspend':
-        // НЕ рвём WebSocket: это прямое требование документации ядра.
-        // Приостанавливается только отрисовка — соединение живёт.
-        suspended = true;
-        break;
-      case 'embed.resume':
-        suspended = false;
-        break;
-      default:
-        break;
-    }
-  });
-}
+  switch (data.type) {
+    case 'embed.viewport':
+      viewport = data;
+      applyViewport();
+      break;
+    case 'embed.suspend':
+      // НЕ рвём WebSocket: это прямое требование документации ядра.
+      // Приостанавливается только отрисовка — соединение живёт.
+      if (userInteraction) userInteraction.setVisibility(false);
+      break;
+    case 'embed.resume':
+      if (userInteraction) userInteraction.setVisibility(true);
+      break;
+    default:
+      break;
+  }
+});
 
-let suspended = false;
-
-function applyViewport(session, msg) {
-  const width = Math.max(1, Math.floor(msg.widthPx || canvasEl.clientWidth));
-  const height = Math.max(1, Math.floor(msg.heightPx || canvasEl.clientHeight));
-  const scale = msg.devicePixelRatio || window.devicePixelRatio || 1;
+function applyViewport() {
+  if (!userInteraction) return;
+  const { width, height, scale } = currentViewport();
   try {
-    session.resize(width, height, scale);
+    userInteraction.resize(width, height, scale);
   } catch (e) {
     // Сервер может не поддерживать Display Control. Это не повод рвать сессию:
-    // картинка просто останется прежнего размера.
+    // разрешение просто останется тем, с которым подключились, а компонент
+    // отцентрирует картинку (flexcenter).
     console.warn('resize отклонён сервером:', e);
   }
 }
@@ -94,52 +131,80 @@ async function main() {
   await init('info');
 
   const tunnelUrl = tunnelUrlFromLocation();
+
+  // Элемент создаётся здесь, а не стоит в разметке. Статические импорты
+  // выполняются до тела модуля, поэтому элемент из разметки поднимается и
+  // рассылает ready раньше, чем мы успеваем подписаться, — подписка не
+  // срабатывала вовсе, и страница вечно висела на «Connecting…».
+  const sessionEl = document.createElement('iron-remote-desktop');
+  // scale="real" — пиксель в пиксель: разрешение запрашивается по размеру
+  // панели, поэтому подгонять масштабом нечего. flexcenter центрирует
+  // картинку, если сервер менять разрешение отказался.
+  sessionEl.setAttribute('scale', 'real');
+  sessionEl.setAttribute('flexcenter', '');
+  const ready = new Promise((resolve) => {
+    sessionEl.addEventListener('ready', (event) => resolve(event.detail.irgUserInteraction), { once: true });
+  });
+  mountEl.appendChild(sessionEl);
+
+  // Присвоение module запускает инициализацию компонента и приводит к ready.
+  sessionEl.module = Backend;
+  userInteraction = await ready;
+
   setStatus('Authenticating…');
 
-  const builder = new Backend.SessionBuilder();
-  builder
-    .proxyAddress(tunnelUrl)
+  const { width, height } = currentViewport();
+  const config = userInteraction
+    .configBuilder()
     // Плагин игнорирует и адрес, и токен из RDCleanPath-запроса: адрес он
     // берёт из session.connect.fields, а авторизацию уже сделал токен ядра в
     // самом URL туннеля. Значения здесь — заглушки, и это не небрежность:
     // доверять тому, что напишет недоверенная страница, нельзя.
-    .destination('0.0.0.0:3389')
-    .authToken('unused')
+    .withDestination('0.0.0.0:3389')
+    .withProxyAddress(tunnelUrl)
+    .withAuthToken('unused')
     // Учётных данных у этой страницы нет и не будет. Поля обязательные, но
     // ни в NLA, ни в логон они не попадут: NLA завершён плагином, а логон
     // проходит делегированными TSCredentials.
-    .username('-')
-    .password('-')
-    .renderCanvas(canvasEl)
-    .setCursorStyleCallback(setCursorStyle)
-    .setCursorStyleCallbackContext({})
+    .withUsername('-')
+    .withPassword('-')
+    // Разрешение запрашивается по размеру панели: подогнать картинку
+    // масштабом — не то же самое, что показать её как есть.
+    .withDesktopSize({ width, height })
     // Точка отсечения: браузер не запрашивает NLA и не пытается его вести.
     // Отсюда следует и то, что клиент объявляет ТОЛЬКО SSL и отвергает ответ
     // с любым другим протоколом. Поэтому плагин отвечает ему selected = SSL, а
     // серверу правит одно поле в первом MCS-сообщении — см. internal/proxy/mcs.go.
     // Снять этот флаг — значит сломать всю схему.
-    .extension(enableCredssp(false));
+    .withExtension(enableCredssp(false))
+    .build();
 
-  const session = await builder.connect();
-  listenToHost(session);
+  userInteraction.onWarningCallback((text) => console.warn('ironrdp:', text));
+
+  await userInteraction.connect(config);
   setStatus('');
 
-  const info = await session.run();
-  setStatus(`Session ended: ${info.reason()}`);
+  // Видимость компонент сам не включает — это делает хост.
+  //
+  // Не косметика: скрытое состояние вешает на обёртку pointer-events: none,
+  // то есть мышь до канваса не доходит вовсе. Проверено на стенде: класс
+  // hidden снимается ровно этим вызовом.
+  userInteraction.setVisibility(true);
+
+  // Фокус — иначе клавиатура молчит до первого клика по панели. Пользователь,
+  // открывший вкладку и начавший печатать, вправе ожидать, что печатается.
+  focusSession(sessionEl);
+
+  applyViewport();
 }
 
-function setCursorStyle(kind, dataUrl, hotspotX, hotspotY) {
-  if (suspended) return;
-  switch (kind) {
-    case 'none':
-      canvasEl.style.cursor = 'none';
-      break;
-    case 'url':
-      canvasEl.style.cursor = `url(${dataUrl}) ${hotspotX} ${hotspotY}, default`;
-      break;
-    default:
-      canvasEl.style.cursor = 'default';
-  }
+// focusSession отдаёт фокус компоненту и возвращает его после переключения
+// вкладок: сессия, потерявшая фокус, перестаёт принимать клавиатуру, а внешне
+// выглядит рабочей.
+function focusSession(el) {
+  el.focus();
+  window.addEventListener('focus', () => el.focus());
+  el.addEventListener('mousedown', () => el.focus());
 }
 
 main().catch((e) => {
