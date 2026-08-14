@@ -12,8 +12,10 @@ var ErrNoNegotiation = errors.New("x224: в Connection Request нет RDP_NEG_RE
 // RewriteRequestForServer переписывает запрошенные протоколы браузера на
 // HYBRID и только на него.
 //
-// Это половина точки отсечения: браузер просит SSL и NLA не делает, а мы просим
-// у сервера NLA и делаем его сами. Вторая половина — ConnectConfirmForBrowser.
+// Это половина точки отсечения: браузер NLA не делает (страница отключает его
+// флагом enableCredssp), а мы просим у сервера NLA и выполняем его сами.
+// Вторая половина — ответ сервера, который уезжает браузеру без правок:
+// см. proxy.serverLeg.connectConfirm и объяснение там.
 //
 // HYBRID_EX сознательно не запрашивается, хотя сервер его поддерживает и
 // выбрал бы (проверено на 192.168.31.38): HYBRID_EX добавляет после CredSSP
@@ -54,30 +56,6 @@ func buildConnectRequest(variable []byte, flags byte, requested uint32) ([]byte,
 	out = binary.LittleEndian.AppendUint16(out, negLen)
 	out = binary.LittleEndian.AppendUint32(out, requested)
 	return out, nil
-}
-
-// ConnectConfirmForBrowser собирает Connection Confirm с selected = SSL.
-//
-// Это вторая половина точки отсечения. Увидев SSL, коннектор ironrdp-web
-// пропускает NLA («CredSSP is disabled, skipping NLA») и уходит прямо в MCS —
-// проверено вживую в фазе 0a, в том числе когда браузер запрашивал HYBRID.
-//
-// Флаги нулевые намеренно: они относятся к возможностям, о которых с браузером
-// договариваться не о чем, а транслировать флаги настоящего сервера значило бы
-// обещать от его имени то, чего мы для этого плеча не поддерживаем.
-func ConnectConfirmForBrowser() []byte {
-	bodyLen := fixedTPDULen + negLen
-	total := tpktHeaderLen + 1 + bodyLen
-
-	out := make([]byte, 0, total)
-	out = append(out, tpktVersion, 0x00)
-	out = binary.BigEndian.AppendUint16(out, uint16(total))
-	out = append(out, byte(bodyLen)) // LI
-	out = append(out, tpduCC, 0x00, 0x00, 0x00, 0x00, 0x00)
-	out = append(out, negTypeRsp, 0x00)
-	out = binary.LittleEndian.AppendUint16(out, negLen)
-	out = binary.LittleEndian.AppendUint32(out, ProtocolSSL)
-	return out
 }
 
 // RequireHybrid проверяет, что сервер выбрал именно CredSSP.

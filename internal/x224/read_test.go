@@ -12,7 +12,13 @@ import (
 // Connection Confirm по тому же потоку идёт TLS ClientHello, и лишний
 // прочитанный байт увёл бы его у crypto/tls.
 func TestReadPDUStopsAtPacketBoundary(t *testing.T) {
-	cc := x224.ConnectConfirmForBrowser()
+	// Connection Confirm с NEG_RSP, собранный здесь же: ReadPDU проверяется на
+	// границе пакета, а не на чьей-то ещё функции.
+	cc := []byte{
+		0x03, 0x00, 0x00, 0x13,
+		0x0E, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00,
+	}
 	trailing := []byte{0x16, 0x03, 0x01} // начало TLS-записи
 	r := bytes.NewReader(append(append([]byte(nil), cc...), trailing...))
 

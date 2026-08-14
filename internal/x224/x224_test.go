@@ -118,26 +118,6 @@ func TestRewriteRequestRejectsRequestWithoutNegReq(t *testing.T) {
 	}
 }
 
-// Ответ браузеру: selected = SSL. Это и есть точка отсечения.
-func TestConfirmForBrowserSelectsSSL(t *testing.T) {
-	out := x224.ConnectConfirmForBrowser()
-	cc, err := x224.ParseConnectConfirm(out)
-	if err != nil {
-		t.Fatalf("ParseConnectConfirm: %v", err)
-	}
-	if cc.Selected != x224.ProtocolSSL {
-		t.Fatalf("Selected = %#x, ожидался SSL", cc.Selected)
-	}
-	want := []byte{
-		0x03, 0x00, 0x00, 0x13,
-		0x0E, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x02, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
-	}
-	if !bytes.Equal(out, want) {
-		t.Fatalf("\n got % x\nwant % x", out, want)
-	}
-}
-
 func TestParseConfirmRejectsMalformed(t *testing.T) {
 	cases := map[string][]byte{
 		"пусто":            {},
