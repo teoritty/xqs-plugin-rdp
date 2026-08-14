@@ -10,9 +10,9 @@ Upstream:  https://github.com/Devolutions/IronRDP
 Licence:   MIT OR Apache-2.0  (see LICENSE-MIT next to this file)
 Vendored:  2026-08-14
 
-`iron-remote-desktop-rdp.js` is ~6.1 MB because the WebAssembly module is
-embedded in it. That size is the price of not writing an RDP stack, and it is
-paid once per release rather than per session.
+The bundle is NOT a verbatim copy: the WebAssembly module has been lifted out
+of the JavaScript. See "The one patch" below — it is not cosmetic, the plugin
+does not work without it.
 
 Why vendored rather than fetched at build time
 ----------------------------------------------
@@ -27,13 +27,43 @@ needed at runtime, but they are the only documentation of this API that is
 guaranteed to match the pinned version, and the 0.x series changes shape
 between minor releases.
 
+The one patch
+-------------
+
+Upstream ships the WebAssembly module inlined into the JavaScript as a
+`data:application/wasm;base64,…` string, which its loader retrieves with
+`fetch()`. The host serves embed routes with `connect-src 'self'`, and `data:`
+is not part of that: the fetch is blocked, `init()` fails with "Failed to
+fetch", and the page never even opens its tunnel. Observed live, not deduced.
+
+So `cmd/xqs-rdp-vendor` decodes that base64 into `iron-remote-desktop-rdp.wasm`
+next to the module and replaces the string literal with
+
+    new URL("./iron-remote-desktop-rdp.wasm", import.meta.url)
+
+The request becomes same-origin and passes. The loader accepts a URL exactly
+where it accepted a string, so nothing else changes, and Go serves `.wasm` as
+`application/wasm`, so the fast `instantiateStreaming` path still applies.
+
+Side effect: 6.1 MB of JavaScript becomes 75 KB of JavaScript plus 4.3 MB of
+WebAssembly — base64 costs a third more than the bytes it encodes.
+
 Verifying and updating
 ----------------------
 
     sha256sum -c SHA256SUMS
+    go run ./cmd/xqs-rdp-vendor        # re-does the copy and the patch
 
-To update, re-install the pinned versions, copy the four files here, and
-regenerate SHA256SUMS. Read the upstream changelog first: this is a 0.x
-package, and a breaking change between minor versions is normal rather than
-exceptional. In particular, `enableCredssp(false)` must keep working — the
-plugin's entire security model rests on the browser not performing NLA.
+Run the vendor command rather than copying by hand: the patch has to be applied
+identically every time, and "remember to also extract the wasm" is exactly the
+kind of step that gets skipped once.
+
+Read the upstream changelog first. This is a 0.x package, and a breaking change
+between minor versions is normal rather than exceptional. Two things must keep
+holding:
+
+  - `enableCredssp(false)` must still exist and still work. The plugin's entire
+    security model rests on the browser not performing NLA.
+  - the wasm must still be inlined as a data URI, or the patch must be revisited.
+    The vendor command fails loudly if it cannot find one, rather than quietly
+    producing a bundle that would be blocked at runtime.
