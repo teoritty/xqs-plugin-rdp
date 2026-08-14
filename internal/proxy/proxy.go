@@ -10,6 +10,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -106,6 +107,12 @@ func Handshake(ctx context.Context, browser, server net.Conn, target Target) (ne
 		return nil, fmt.Errorf("proxy: отправка RDCleanPath-ответа: %w", err)
 	}
 
+	// Последний шаг рукопожатия: первое сообщение браузера правится и уходит
+	// серверу. Дальше поток не разбирается совсем.
+	if err := forwardConnectInitial(browser, serverTLS, leg.selected); err != nil {
+		return nil, err
+	}
+
 	// Дедлайны рукопожатия сняты: дальше поток живёт без общего срока.
 	_ = browser.SetDeadline(time.Time{})
 	_ = server.SetDeadline(time.Time{})
@@ -132,10 +139,9 @@ func readRequest(browser net.Conn) (cleanpath.Request, error) {
 type serverLeg struct {
 	tls   net.Conn
 	chain [][]byte
-	// connectConfirm — ответ сервера на Connection Request, как он пришёл.
-	// Уезжает браузеру без правок: в нём выбранный протокол, по которому
-	// клиент заполняет clientCoreData.
-	connectConfirm []byte
+	// selected — протокол, который выбрал сервер. Браузеру он не сообщается
+	// (тот его отвергнет), но именно его сервер ждёт обратно в MCS.
+	selected uint32
 }
 
 // connectServer доводит серверную половину до готового к релею TLS-потока.
@@ -195,30 +201,51 @@ func connectServer(ctx context.Context, server net.Conn, browserCR []byte, targe
 	for _, c := range certs {
 		chain = append(chain, c.Raw)
 	}
-	return serverLeg{tls: tlsConn, chain: chain, connectConfirm: raw}, nil
+	return serverLeg{tls: tlsConn, chain: chain, selected: cc.Selected}, nil
 }
 
 // browserResponse собирает RDCleanPath-ответ браузеру.
 //
-// Connect Confirm уходит НАСТОЯЩИЙ, байт в байт от сервера.
+// Connect Confirm называет SSL, а не то, что выбрал сервер. Это не небрежность
+// и не упрощение: клиент объявляет только SSL (страница отключает CredSSP) и
+// отвергает ответ с любым другим протоколом — «client advertised SSL, but
+// server selected HYBRID», ironrdp-connector/src/lib.rs:409. Проверено на
+// стенде: с HYBRID клиент закрывает сокет, не отправив ни байта.
 //
-// Раньше здесь собирался синтетический ответ с selected = SSL — чтобы клиент
-// пропустил NLA. Это оказалось и лишним, и вредным. Лишним: NLA страница
-// отключает флагом enableCredssp(false), и выбранный протокол на это не
-// влияет. Вредным: клиент кладёт selected в clientCoreData полем
-// server_selected_protocol, и сервер, выбравший HYBRID, обрывает соединение на
-// первом же MCS-сообщении, получив от клиента SSL. Снаружи это выглядело как
-// «висит на authenticating», потому что рвётся уже после точки отсечения.
+// Расплата за это — правка одного поля в первом MCS-сообщении, см. mcs.go.
 //
-// После неё браузер говорит с настоящим сервером через наш релей — значит и
-// возможности из ответа сервера настоящие, и обнулять их значило бы соврать о
-// собеседнике второй раз.
+// Флаги нулевые намеренно: они относятся к возможностям, о которых с браузером
+// договариваться не о чем.
 func browserResponse(leg serverLeg, addr string) ([]byte, error) {
-	resp, err := cleanpath.BuildResponse(leg.connectConfirm, leg.chain, addr)
+	return cleanpath.BuildResponse(connectConfirmForBrowser(), leg.chain, addr)
+}
+
+// connectConfirmForBrowser собирает Connection Confirm с selected = SSL.
+func connectConfirmForBrowser() []byte {
+	out := []byte{0x03, 0x00, 0x00, 0x13, 0x0E, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00}
+	return binary.LittleEndian.AppendUint32(out, x224.ProtocolSSL)
+}
+
+// forwardConnectInitial принимает от браузера первое сообщение после точки
+// отсечения, исправляет в нём заявленный протокол и отправляет серверу.
+//
+// Читается ровно один TPKT-пакет: за ним сразу идёт поток, который мы больше не
+// разбираем, и лишний прочитанный байт увёл бы его у релея.
+func forwardConnectInitial(browser io.Reader, server io.Writer, selected uint32) error {
+	pdu, err := x224.ReadPDU(browser)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("proxy: чтение MCS Connect Initial: %w", err)
 	}
-	return resp, nil
+	if !patchServerSelectedProtocol(pdu, selected) {
+		// Поле необязательное. Не найдя его, идём дальше: сервер такому
+		// клиенту ничего не предъявит, а обрывать подключение из-за
+		// отсутствия того, что и не обязано быть, — хуже.
+		slog.Warn("proxy: в MCS Connect Initial нет CS_CORE — протокол не исправлен")
+	}
+	if _, err := server.Write(pdu); err != nil {
+		return fmt.Errorf("proxy: отправка MCS Connect Initial: %w", err)
+	}
+	return nil
 }
 
 // verifyPeer спрашивает ядро, тот ли это сервер.
