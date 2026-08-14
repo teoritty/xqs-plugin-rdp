@@ -133,3 +133,8 @@ func (m *Manager) shutdown(ipc.Request) (any, *ipc.Error) {
 func (m *Manager) ping(ipc.Request) (any, *ipc.Error) {
 	return map[string]any{"ok": true}, nil
 }
+
+// APIVersion сообщает версию Plugin API, под которую написан плагин. Она же
+// стоит в requires.pluginApi манифеста, и тест композиционного корня следит,
+// чтобы эти два места не разъехались.
+func APIVersion() string { return pluginAPIVersion }

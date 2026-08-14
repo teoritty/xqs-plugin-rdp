@@ -1,0 +1,94 @@
+{
+  "id": "com.xquakshell.rdp",
+  "name": "RDP",
+  "version": "0.1.0-dev",
+  "description": "RDP session client (embed viewer) for xQuakShell.",
+  "engine": {
+    "type": "go-binary",
+    "entry": "xqs-rdp.exe"
+  },
+  "isolation": "per-session",
+  "activationEvents": ["onProtocol:rdp"],
+  "requires": {
+    "pluginApi": "1.0.0"
+  },
+  "capabilities": {
+    "session": {
+      "connectProtocols": ["rdp"],
+      "embed": true,
+      "terminal": false
+    },
+    "network": {
+      "outbound": [],
+      "allowArbitraryOutbound": true,
+      "allowPrivateNetworks": true
+    },
+    "channel": {
+      "purposes": ["embed-stream", "tcp-relay"],
+      "maxConcurrent": 2
+    }
+  },
+  "contributions": {
+    "connectionProtocols": [
+      {
+        "id": "rdp",
+        "label": "RDP",
+        "defaultPort": 3389,
+        "icon": "monitor",
+        "embedEntry": "ui/rdp.html",
+        "fields": [
+          {
+            "id": "auth",
+            "label": "Authentication",
+            "order": 1,
+            "fields": [
+              {
+                "id": "username",
+                "label": "Username",
+                "type": "text",
+                "width": "half",
+                "order": 1,
+                "secret": false,
+                "required": true
+              },
+              {
+                "id": "domain",
+                "label": "Domain",
+                "description": "Optional. Leave empty for a local account.",
+                "type": "text",
+                "width": "half",
+                "order": 2,
+                "secret": false
+              },
+              {
+                "id": "password",
+                "label": "Password",
+                "type": "password",
+                "width": "full",
+                "order": 3,
+                "secret": true,
+                "required": true
+              }
+            ]
+          },
+          {
+            "id": "trust",
+            "label": "Server trust",
+            "order": 2,
+            "fields": [
+              {
+                "id": "serverFingerprint",
+                "label": "Server key fingerprint",
+                "description": "SHA-256 fingerprint of the server's public key. Leave empty on the first attempt: the connection is refused and the fingerprint is shown, so you can verify it and paste it here.",
+                "type": "text",
+                "width": "full",
+                "order": 1,
+                "secret": false
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
