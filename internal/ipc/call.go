@@ -134,3 +134,15 @@ func (d *Dispatcher) SendChannelFrame(channelID uint32, payload []byte) error {
 	defer d.mu.Unlock()
 	return WriteFrame(d.w, Frame{Kind: KindChannelData, ChannelID: channelID, Payload: payload})
 }
+
+// SendCreditFrame отправляет кредитное обновление (kind=0x03).
+//
+// Отдельный метод, а не флаг у SendChannelFrame: вид фрейма — это протокол, а
+// не параметр. Спутать их стоило одной сессии: кредит, ушедший как данные
+// канала, доезжает до другого конца как восемь байт мусора в начале потока —
+// браузер закрывает соединение, RDP-сервер обрывает его как нарушение.
+func (d *Dispatcher) SendCreditFrame(channelID uint32, payload []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return WriteFrame(d.w, Frame{Kind: KindCredit, ChannelID: channelID, Payload: payload})
+}

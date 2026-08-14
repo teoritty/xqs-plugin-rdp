@@ -18,13 +18,18 @@ type fakeHost struct {
 	calls    []string
 	params   []any
 	frames   map[uint32][][]byte
+	credits  map[uint32][][]byte
 	openID   uint32
 	callErr  error
 	sendFail error
 }
 
 func newFakeHost(openID uint32) *fakeHost {
-	return &fakeHost{frames: make(map[uint32][][]byte), openID: openID}
+	return &fakeHost{
+		frames:  make(map[uint32][][]byte),
+		credits: make(map[uint32][][]byte),
+		openID:  openID,
+	}
 }
 
 func (h *fakeHost) Call(_ context.Context, method string, params, result any) error {
@@ -57,11 +62,33 @@ func (h *fakeHost) SendChannelFrame(channelID uint32, payload []byte) error {
 	return nil
 }
 
+// SendCreditFrame учитывается ОТДЕЛЬНО от данных. Раздельный учёт здесь не
+// педантизм: ровно потому, что прошлая версия фейка складывала их в одну кучу,
+// тест «кредит выдан» проходил, пока кредит уходил как данные канала — и мусор
+// доезжал до браузера и до RDP-сервера.
+func (h *fakeHost) SendCreditFrame(channelID uint32, payload []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sendFail != nil {
+		return h.sendFail
+	}
+	h.credits[channelID] = append(h.credits[channelID], append([]byte(nil), payload...))
+	return nil
+}
+
 func (h *fakeHost) sentOn(channelID uint32) [][]byte {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make([][]byte, len(h.frames[channelID]))
 	copy(out, h.frames[channelID])
+	return out
+}
+
+func (h *fakeHost) creditsOn(channelID uint32) [][]byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([][]byte, len(h.credits[channelID]))
+	copy(out, h.credits[channelID])
 	return out
 }
 
@@ -266,9 +293,14 @@ func TestManagerIgnoresMalformedCredit(t *testing.T) {
 	m.OnFrame(7, 0x09, []byte{1})
 }
 
-// Прочитанные фреймы обязаны превращаться в кредит, уходящий хосту: иначе
-// источник встанет и больше не поедет.
-func TestManagerGrantsCreditAsDataIsRead(t *testing.T) {
+// Прочитанные фреймы обязаны превращаться в кредит, уходящий хосту ОТДЕЛЬНЫМ
+// видом фрейма (kind=0x03), а не как данные канала.
+//
+// Предыдущая версия этого теста проверяла, что грант ушёл через
+// SendChannelFrame, — то есть закрепляла дефект как ожидаемое поведение.
+// Проявился он только на живом стенде: восемь байт кредита доехали до браузера
+// и до RDP-сервера как содержимое потока, и оба конца оборвали соединение.
+func TestManagerGrantsCreditAsCreditFrameNotData(t *testing.T) {
 	h := newFakeHost(4)
 	m := transport.NewManager(h)
 	conn, err := m.Open(context.Background(), transport.PurposeTCPRelay, "s", "")
@@ -283,17 +315,20 @@ func TestManagerGrantsCreditAsDataIsRead(t *testing.T) {
 		t.Fatalf("Read: %v", err)
 	}
 
-	frames := h.sentOn(4)
-	if len(frames) != 1 {
-		t.Fatalf("хосту отправлено %d фреймов, ожидался 1 кредитный", len(frames))
+	if data := h.sentOn(4); len(data) != 0 {
+		t.Fatalf("кредит ушёл как данные канала: % x", data)
 	}
-	if len(frames[0]) != 8 {
-		t.Fatalf("кредитный фрейм %d байт, ожидалось 8", len(frames[0]))
+	credits := h.creditsOn(4)
+	if len(credits) != 1 {
+		t.Fatalf("кредитных фреймов %d, ожидался 1", len(credits))
 	}
-	if got := binary.BigEndian.Uint32(frames[0][0:4]); got != 4 {
+	if len(credits[0]) != 8 {
+		t.Fatalf("кредитный фрейм %d байт, ожидалось 8", len(credits[0]))
+	}
+	if got := binary.BigEndian.Uint32(credits[0][0:4]); got != 4 {
 		t.Fatalf("кредит адресован каналу %d", got)
 	}
-	if got := binary.BigEndian.Uint32(frames[0][4:8]); got != 1 {
+	if got := binary.BigEndian.Uint32(credits[0][4:8]); got != 1 {
 		t.Fatalf("выдано %d кредитов, ожидался 1", got)
 	}
 }

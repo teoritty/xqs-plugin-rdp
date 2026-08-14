@@ -48,7 +48,14 @@ func purposeLimits(p Purpose) (credit, maxFrame int, ok bool) {
 // котором видно, что transport умеет ровно две вещи — звать хост и слать байты.
 type Host interface {
 	Call(ctx context.Context, method string, params, result any) error
+	// SendChannelFrame отправляет данные канала (kind=0x02).
 	SendChannelFrame(channelID uint32, payload []byte) error
+	// SendCreditFrame отправляет кредитное обновление (kind=0x03).
+	//
+	// Метод отдельный намеренно: перепутать вид фрейма — значит отправить
+	// кредит как данные, и другой конец получит восемь байт мусора в начале
+	// потока вместо управляющего сообщения.
+	SendCreditFrame(channelID uint32, payload []byte) error
 }
 
 // Manager открывает каналы и разводит по ним входящие фреймы.
@@ -173,7 +180,7 @@ func (m *Manager) grant(channelID uint32, n int) {
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint32(payload[0:4], channelID)
 	binary.BigEndian.PutUint32(payload[4:8], uint32(n))
-	if err := m.host.SendChannelFrame(channelID, payload); err != nil {
+	if err := m.host.SendCreditFrame(channelID, payload); err != nil {
 		slog.Warn("transport: не удалось выдать кредит", "channelId", channelID, "err", err.Error())
 	}
 }
