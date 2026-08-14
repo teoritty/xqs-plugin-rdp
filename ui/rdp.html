@@ -12,7 +12,12 @@
     font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
     overflow: hidden;
   }
-  #screen {
+  /*
+   * Компонент сам держит канвас и сам решает, как его показать. Растягивать
+   * его в CSS нельзя: именно так картинка сервера и оказывалась натянутой на
+   * панель. Здесь задаётся только место, которое он занимает.
+   */
+  #session, #session > iron-remote-desktop {
     display: block;
     width: 100%;
     height: 100%;
@@ -26,12 +31,20 @@
     padding: 2rem;
     text-align: center;
     white-space: pre-wrap;
+    background: #101014;
   }
   #status.error { color: #ff8080; }
 </style>
 </head>
 <body>
-  <canvas id="screen"></canvas>
+  <!--
+    Сам <iron-remote-desktop> создаётся в boot.js, а не стоит здесь.
+    Причина в порядке выполнения: статические импорты выполняются раньше тела
+    модуля, поэтому элемент из разметки успевает подняться и разослать своё
+    событие ready до того, как страница на него подпишется. Проверено —
+    подписка не срабатывала вовсе.
+  -->
+  <div id="session"></div>
   <div id="status">Connecting…</div>
   <script type="module" src="./boot.js"></script>
 </body>
