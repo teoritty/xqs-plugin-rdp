@@ -231,3 +231,39 @@ func TestUnknownResponseIsIgnored(t *testing.T) {
 		t.Fatal("Serve не завершился")
 	}
 }
+
+// Вид фрейма — часть протокола, а не деталь оформления. Кредит, ушедший как
+// данные канала, доезжает до другого конца мусором в потоке: браузер закрывает
+// соединение, RDP-сервер обрывает его как нарушение. Проверяется именно байт
+// kind, потому что перепутать эти два метода легко, а заметить — нет.
+func TestSendersUseTheirOwnFrameKinds(t *testing.T) {
+	cases := []struct {
+		name string
+		send func(*ipc.Dispatcher) error
+		kind byte
+	}{
+		{"данные канала", func(d *ipc.Dispatcher) error { return d.SendChannelFrame(3, []byte{1, 2}) }, ipc.KindChannelData},
+		{"кредит", func(d *ipc.Dispatcher) error { return d.SendCreditFrame(3, make([]byte, 8)) }, ipc.KindCredit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHostPipe()
+			d := ipc.NewDispatcher(h.fromPlugin)
+			go func() {
+				if err := tc.send(d); err != nil {
+					t.Errorf("send: %v", err)
+				}
+			}()
+			f, err := ipc.ReadFrame(h.fromRead)
+			if err != nil {
+				t.Fatalf("ReadFrame: %v", err)
+			}
+			if f.Kind != tc.kind {
+				t.Fatalf("kind = %#x, ожидался %#x", f.Kind, tc.kind)
+			}
+			if f.ChannelID != 3 {
+				t.Fatalf("channelId = %d", f.ChannelID)
+			}
+		})
+	}
+}
