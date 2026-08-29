@@ -1,13 +1,211 @@
-# You can override the included template(s) by including variable overrides
-# SAST customization: https://docs.gitlab.com/user/application_security/sast/#available-cicd-variables
-# Secret Detection customization: https://docs.gitlab.com/user/application_security/secret_detection/pipeline/configure/
-# Dependency Scanning customization: https://docs.gitlab.com/user/application_security/dependency_scanning/dependency_scanning_sbom/#customizing-analyzer-behavior
-# Container Scanning customization: https://docs.gitlab.com/user/application_security/container_scanning/#customizing-analyzer-behavior
-# Note that environment variables can be set in several places
-# See https://docs.gitlab.com/ci/variables/#cicd-variable-precedence
+# CI/CD for the xQuakShell RDP plugin.
+#
+# Two things happen here, and only these two:
+#
+#   * On a branch or merge request: the same gates a contributor runs locally —
+#     gofmt, go vet, and the race-tested suite. Nothing is published.
+#
+#   * On a tag vX.Y.Z (including pre-release tags like v1.0.0-pre.1): the gates
+#     run again — a tag must never produce artifacts a branch could not — then
+#     the six platform bundles are packed, uploaded to this project's generic
+#     package registry, and attached to a GitLab Release as asset links.
+#
+# Why bundles only, no bare binaries: this plugin's interface *is* the plugin.
+# The manifest declares `embedEntry: ui/rdp.html`, and a bare binary carries no
+# ui/ (the vendored IronRDP WASM viewer). A host that installed one would get a
+# session that connects and then 404s on its own page. The VNC plugin publishes
+# the same way, for the same reason; telnet and docker publish bare binaries too
+# because their UI is a terminal the host draws.
+#
+# The host (xQuakShell) reads a GitLab release's `assets.links` and downloads by
+# `direct_asset_url`. Setting `filepath` on each link is what makes GitLab mint
+# that permalink (…/-/releases/<tag>/downloads/<name>), so the links below are
+# deliberately given one.
+
 stages:
-- test
-sast:
+  - test
+  - package
+  - release
+
+variables:
+  # Pinned to the toolchain the module is written against (go.mod: go 1.26).
+  GO_IMAGE: "golang:1.26"
+  # Generic-package registry name. Stable across releases; the version segment of
+  # each upload is the tag, so every release's assets live under their own path.
+  PKG_NAME: "rdp"
+  GOPATH: "$CI_PROJECT_DIR/.gopath"
+  GOCACHE: "$CI_PROJECT_DIR/.gocache"
+  GOMODCACHE: "$CI_PROJECT_DIR/.gomodcache"
+
+# Avoid the duplicate "branch + merge request" pipeline GitLab creates by
+# default: run a merge-request pipeline for MRs, a branch pipeline only when no
+# MR is open for that branch, and always run for tags.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+
+test:
   stage: test
-include:
-- template: Security/SAST.gitlab-ci.yml
+  image: "$GO_IMAGE"
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .gocache/
+      - .gomodcache/
+  rules:
+    # The tag build re-runs the gates itself; running them here too would be a
+    # second, redundant pipeline on the same commit.
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - test -z "$(gofmt -l .)" || { echo 'gofmt reports unformatted files:'; gofmt -l .; exit 1; }
+    - go vet ./...
+    - go test ./... -count=1 -race
+
+# Pack all platforms, verify the release is internally consistent, and upload
+# every asset to the generic package registry so the release job can link them.
+package:
+  stage: package
+  image: "$GO_IMAGE"
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .gocache/
+      - .gomodcache/
+    policy: pull
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  script:
+    # A tag must not produce artifacts the branch could not.
+    - test -z "$(gofmt -l .)" || { echo 'gofmt reports unformatted files:'; gofmt -l .; exit 1; }
+    - go vet ./...
+    - go test ./... -count=1 -race
+
+    # Two manifests carry the same identity for two install routes. If they
+    # disagree, one route would install a plugin the other refuses — and nothing
+    # would say which is right.
+    - |
+      for field in id version; do
+        a=$(grep -o "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" plugin.json | head -1)
+        b=$(grep -o "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" xqsp.json  | head -1)
+        if [ "$a" != "$b" ]; then
+          echo "plugin.json and xqsp.json disagree on $field: [$a] vs [$b]" >&2
+          exit 1
+        fi
+      done
+
+    # A bundle whose manifest says one version while the release says another is
+    # the kind of mismatch nobody notices until an upgrade silently does nothing.
+    - |
+      tag="${CI_COMMIT_TAG#v}"
+      manifest=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' plugin.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+      if [ "$tag" != "$manifest" ]; then
+        echo "tag $tag does not match plugin.json version $manifest" >&2
+        exit 1
+      fi
+
+    # One run cross-compiles every target and packs a bundle each: plugin.json
+    # with engine.entry set for the platform, the binary, the whole ui/ tree, and
+    # a per-bundle SHA256SUMS. CGO is off inside the packer, so the binaries are
+    # static and run on the user's machine, not ours.
+    - go run ./cmd/xqs-rdp-pack -out dist
+
+    # Stage exactly what ships: the bundles, plus one release-level SHA256SUMS
+    # over them so a downloader can verify the set as a whole.
+    - mkdir -p dist/release
+    - cp dist/*.xqsp dist/release/
+    - cd dist/release && sha256sum * > SHA256SUMS && cat SHA256SUMS && cd "$CI_PROJECT_DIR"
+
+    # Upload each asset to the generic package registry. --fail turns any non-2xx
+    # into a job failure instead of a release that links a file that isn't there.
+    - |
+      for f in dist/release/*; do
+        name=$(basename "$f")
+        echo "uploading $name"
+        curl --fail --silent --show-error \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG_NAME}/${CI_COMMIT_TAG}/${name}"
+      done
+  artifacts:
+    name: "xqs-plugin-rdp-$CI_COMMIT_TAG"
+    paths:
+      - dist/release/
+    expire_in: 30 days
+
+# Create the GitLab Release. release-cli lives in its own image (no Go here), so
+# this is a separate job that consumes nothing from the packer except the fact it
+# succeeded — the asset URLs are the registry paths the packer uploaded to.
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: package
+      artifacts: false
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  script:
+    - echo "Creating GitLab Release for $CI_COMMIT_TAG"
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "RDP $CI_COMMIT_TAG"
+    description: |
+      **Pre-release.** RDP session client (embed viewer) for xQuakShell, packaged
+      for six platforms.
+
+      ### Assets
+      `xqs-rdp-<os>-<arch>.xqsp` for windows, linux and darwin on amd64 and arm64,
+      plus a release-level `SHA256SUMS` covering them. Each bundle carries
+      `plugin.json` (with `engine.entry` set for that platform), the static
+      binary, the whole `ui/` tree (the vendored IronRDP WASM viewer) and its own
+      `SHA256SUMS`. Bundles are unsigned; integrity rests on those checksum files.
+
+      No bare binaries. This plugin's interface is the plugin — the manifest
+      declares `embedEntry: ui/rdp.html` — so a bare binary would carry no `ui/`
+      and 404 on its own page.
+
+      ### Install
+      **Add repository** with this project's URL on a host that installs `.xqsp`
+      bundles from GitLab, or **Settings → Plugins → Install bundle…** with the
+      `.xqsp` for your platform. The install asks for consent to reach arbitrary
+      hosts on your network, which is what an RDP client does.
+    assets:
+      links:
+        - name: "xqs-rdp-windows-amd64.xqsp"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/xqs-rdp-windows-amd64.xqsp"
+          filepath: "/xqs-rdp-windows-amd64.xqsp"
+          link_type: "package"
+        - name: "xqs-rdp-windows-arm64.xqsp"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/xqs-rdp-windows-arm64.xqsp"
+          filepath: "/xqs-rdp-windows-arm64.xqsp"
+          link_type: "package"
+        - name: "xqs-rdp-linux-amd64.xqsp"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/xqs-rdp-linux-amd64.xqsp"
+          filepath: "/xqs-rdp-linux-amd64.xqsp"
+          link_type: "package"
+        - name: "xqs-rdp-linux-arm64.xqsp"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/xqs-rdp-linux-arm64.xqsp"
+          filepath: "/xqs-rdp-linux-arm64.xqsp"
+          link_type: "package"
+        - name: "xqs-rdp-darwin-amd64.xqsp"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/xqs-rdp-darwin-amd64.xqsp"
+          filepath: "/xqs-rdp-darwin-amd64.xqsp"
+          link_type: "package"
+        - name: "xqs-rdp-darwin-arm64.xqsp"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/xqs-rdp-darwin-arm64.xqsp"
+          filepath: "/xqs-rdp-darwin-arm64.xqsp"
+          link_type: "package"
+        - name: "SHA256SUMS"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rdp/${CI_COMMIT_TAG}/SHA256SUMS"
+          filepath: "/SHA256SUMS"
+          link_type: "other"
