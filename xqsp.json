@@ -5,7 +5,7 @@
   "description": "RDP session client (embed viewer) for xQuakShell.",
   "author": "teoritty",
   "license": "GPL-3.0",
-  "homepage": "https://gitlab.com/teoritty/xqs-plugin-rdp",
+  "homepage": "https://github.com/teoritty/xqs-plugin-rdp",
   "tags": [
     "rdp",
     "remote-desktop",

@@ -84,12 +84,11 @@ just one.
 ## Releases
 
 Pushing a tag `vX.Y.Z` (pre-release suffixes such as `v1.0.0-pre.2` included)
-builds and publishes a release — on GitHub through
-`.github/workflows/release.yml`, on GitLab through `.gitlab-ci.yml`. Both run
-the same gates as a branch build (gofmt, vet, the race-tested suite), check that
-`plugin.json` and `xqsp.json` agree on `id` and `version` and that the version
-matches the tag, then attach the six `.xqsp` bundles and a `SHA256SUMS` over
-them. To cut one, bump `version` in both manifests, commit, then:
+builds and publishes a GitHub release through `.github/workflows/release.yml`.
+It runs the same gates as a branch build (gofmt, vet, the race-tested suite),
+checks that `plugin.json` and `xqsp.json` agree on `id` and `version` and that
+the version matches the tag, then attaches the six `.xqsp` bundles and a
+`SHA256SUMS` over them. To cut one, bump `version` in both manifests, commit, then:
 
     git tag v1.0.0-pre.2
     git push origin v1.0.0-pre.2
