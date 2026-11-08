@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race is not a nicety here: the plugin is goroutines around one stdio pipe and the TCP
+      # relay to the RDP server, and a data race in either shows up as a corrupted frame the host
+      # kills the process for.
+      - name: Test
+        run: go test ./... -count=1 -race
+
+      # Packing is what a release actually ships, so it is gated on every branch rather than
+      # discovered at tag time.
+      - name: Pack bundles
+        run: go run ./cmd/xqs-rdp-pack -out dist

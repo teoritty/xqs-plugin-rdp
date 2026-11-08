@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      # The same gates CI runs on a branch. A tag must not produce artifacts the branch could not.
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1 -race
+
+      - name: Check plugin.json and xqsp.json agree
+        # Two files carrying the same manifest for two install routes. Letting them drift means one
+        # route installs a plugin the other would refuse, and nothing says which one is right.
+        run: |
+          for field in id version; do
+            a=$(grep -o "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" plugin.json | head -1)
+            b=$(grep -o "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" xqsp.json  | head -1)
+            if [ "$a" != "$b" ]; then
+              echo "plugin.json and xqsp.json disagree on $field: [$a] vs [$b]" >&2
+              exit 1
+            fi
+          done
+
+      - name: Check the manifest version matches the tag
+        # A bundle whose plugin.json says one version while the release says another is the kind of
+        # mismatch nobody notices until an upgrade silently does nothing.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' plugin.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $tag does not match plugin.json version $manifest" >&2
+            exit 1
+          fi
+
+      # One run cross-compiles all six platforms and packs a bundle each: plugin.json with
+      # engine.entry rewritten for the platform, the static binary, the whole ui/ tree (the vendored
+      # IronRDP WASM viewer), and SHA256SUMS. Bundles are unsigned — a key generated inside CI would
+      # be a new identity every release, which is worse than no signature at all.
+      - name: Pack bundles
+        run: go run ./cmd/xqs-rdp-pack -out dist
+
+      # Bundles only, no bare binaries — deliberately.
+      #
+      # This plugin's interface is the plugin: the manifest declares embedEntry ui/rdp.html, and a
+      # bare binary carries no ui/. A host that installs one gets a session that connects and then
+      # answers every request for its own page with a 404.
+      - name: Stage release assets
+        run: |
+          mkdir -p dist/release
+          cp dist/*.xqsp dist/release/
+          cd dist/release && sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Name the tag explicitly. Left to infer it, the action can open a second, draft release
+          # for the same tag and then fail to finalise it after uploading every asset.
+          tag_name: ${{ github.ref_name }}
+          name: RDP ${{ github.ref_name }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/release/*
+          body: |
+            **Pre-release — proof of concept.** The plugin works, but only the essentials are
+            implemented: **screen output, keyboard and mouse.** Clipboard, audio, drive/printer
+            redirection, multi-monitor, RD Gateway and Kerberos are not supported yet.
+
+            ### Assets
+            `xqs-rdp-<os>-<arch>.xqsp` for windows, linux and darwin on amd64 and arm64, plus a
+            release-level `SHA256SUMS` covering them. Each bundle carries `plugin.json` (with
+            `engine.entry` set for that platform), the static binary, the whole `ui/` tree (the
+            vendored IronRDP WASM viewer) and its own `SHA256SUMS`. The bundles are unsigned;
+            integrity rests on those two checksum files.
+
+            No bare binaries. This plugin's interface is the plugin — the manifest declares
+            `embedEntry: ui/rdp.html` — and a bare binary carries no `ui/`, so installing one
+            produces a session that connects and then 404s on its own page.
+
+            ### Requires a host that installs bundles from GitHub
+            **Add GitHub repository** downloads and installs the `.xqsp` on a host that supports
+            it. An older host does not recognise `.xqsp` as a platform asset and reports the
+            platform as unsupported — install from a file instead:
+            **Settings → Plugins → Install bundle…**
+
+            ### Install
+            Either route arrives at the same tree. The install asks for consent to reach arbitrary
+            hosts on your network, which is what an RDP client does.
