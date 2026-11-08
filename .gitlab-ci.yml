@@ -160,8 +160,11 @@ release:
     tag_name: "$CI_COMMIT_TAG"
     name: "RDP $CI_COMMIT_TAG"
     description: |
-      **Pre-release.** RDP session client (embed viewer) for xQuakShell, packaged
-      for six platforms.
+      **Pre-release — proof of concept.** RDP session client (embed viewer) for
+      xQuakShell, packaged for six platforms. The plugin works, but only the
+      essentials are implemented: **screen output, keyboard and mouse.**
+      Clipboard, audio, drive/printer redirection, multi-monitor, RD Gateway and
+      Kerberos are not supported yet.
 
       ### Assets
       `xqs-rdp-<os>-<arch>.xqsp` for windows, linux and darwin on amd64 and arm64,
