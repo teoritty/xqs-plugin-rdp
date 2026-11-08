@@ -4,24 +4,41 @@ An RDP client for [xQuakShell](https://github.com/teoritty/xQuakShell). It adds
 an `rdp` connection protocol and renders the remote desktop in an embedded
 [IronRDP](https://github.com/Devolutions/IronRDP) viewer inside the session tab.
 
-**Status: in development.** Nothing here works yet.
+> **Status: proof of concept.** The plugin works — it connects, authenticates
+> and gives you a usable remote desktop — but only the essentials are there:
+> **the picture, the keyboard and the mouse.** Everything else (clipboard,
+> audio, drive redirection, multi-monitor, …) is not implemented yet. Expect
+> rough edges and breaking changes between pre-releases.
 
-## What it will do
+## What works
 
-- Connect to an RDP server (default port **3389**) with **NLA / CredSSP**.
-- Terminate TLS and CredSSP **host-side, in the plugin process** — the password
+- Connects to an RDP server (default port **3389**) with **NLA / CredSSP**.
+- TLS and CredSSP terminate **host-side, in the plugin process** — the password
   never reaches the browser. The embedded WASM viewer only ever sees an
   already-authenticated stream.
-- Screen, mouse and keyboard, fitted to the session tab.
+- **Screen output, keyboard and mouse**, fitted to the session tab.
+- Server certificate trust, confirmed once per server (see below).
+
+That is the whole feature set of this PoC. Anything not on this list should be
+assumed missing.
 
 ## Requirements
 
 - xQuakShell with plugin API `1.0.0`.
 - A reachable RDP server supporting **NLA (CredSSP over TLS)** with **NTLM**.
 
-## Scope of the first version
+## Install
 
-Deliberately excluded, each for a stated reason:
+Point xQuakShell's plugin manager at this repository (**Add GitHub
+repository**), or download the `.xqsp` bundle for your platform from the
+[Releases](https://github.com/teoritty/xqs-plugin-rdp/releases) page and install
+it via **Settings → Plugins → Install bundle…**. Releases are published as
+pre-releases while the plugin is a PoC.
+
+## Not implemented
+
+Beyond the PoC's picture, keyboard and mouse, nothing else is wired up. Some of
+it is deliberately excluded, each for a stated reason:
 
 | Not included | Why |
 |---|---|
@@ -63,6 +80,19 @@ CredSSP itself has no ready-made Go implementation and is written here.
 The second command cross-compiles for six platforms and writes an installable
 `.xqsp` bundle per platform into `dist/`. Add `-only windows/amd64` to build
 just one.
+
+## Releases
+
+Pushing a tag `vX.Y.Z` (pre-release suffixes such as `v1.0.0-pre.2` included)
+builds and publishes a release — on GitHub through
+`.github/workflows/release.yml`, on GitLab through `.gitlab-ci.yml`. Both run
+the same gates as a branch build (gofmt, vet, the race-tested suite), check that
+`plugin.json` and `xqsp.json` agree on `id` and `version` and that the version
+matches the tag, then attach the six `.xqsp` bundles and a `SHA256SUMS` over
+them. To cut one, bump `version` in both manifests, commit, then:
+
+    git tag v1.0.0-pre.2
+    git push origin v1.0.0-pre.2
 
 Bundles are **unsigned**. The host's signature is Ed25519 over a canonical JSON
 envelope containing its own `plugin.Manifest` Go struct, so signing from outside
